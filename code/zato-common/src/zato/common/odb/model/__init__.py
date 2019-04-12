@@ -1119,6 +1119,7 @@ class OutgoingFTP(Base):
     acct = Column(String(200), nullable=True)
     timeout = Column(Integer, nullable=True)
     port = Column(Integer, server_default=str(FTP_PORT), nullable=False)
+    use_ftps = Column(Boolean(), nullable=False)
     dircache = Column(Boolean(), nullable=False)
 
     # JSON data is here
@@ -1128,7 +1129,7 @@ class OutgoingFTP(Base):
     cluster = relationship(Cluster, backref=backref('out_conns_ftp', order_by=name, cascade='all, delete, delete-orphan'))
 
     def __init__(self, id=None, name=None, is_active=None, host=None, user=None, password=None, acct=None, timeout=None,
-            port=None, dircache=None, cluster_id=None):
+            port=None, dircache=None, use_ftps=None, cluster_id=None):
         self.id = id
         self.name = name
         self.is_active = is_active
@@ -1139,6 +1140,7 @@ class OutgoingFTP(Base):
         self.timeout = timeout
         self.port = port
         self.dircache = dircache
+        self.use_ftps = use_ftps
         self.cluster_id = cluster_id
 
 # ################################################################################################################################

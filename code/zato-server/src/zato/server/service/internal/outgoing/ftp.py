@@ -38,7 +38,7 @@ class GetList(AdminService):
         response_elem = 'zato_outgoing_ftp_get_list_response'
         input_required = ('cluster_id',)
         output_required = ('id', 'name', 'is_active', 'host', 'port')
-        output_optional = ('user', 'acct', 'timeout', Boolean('dircache'))
+        output_optional = ('user', 'acct', 'timeout', Boolean('dircache'), Boolean('use_ftps'))
 
     def get_data(self, session):
         return self._search(out_ftp_list, session, self.request.input.cluster_id, False)
@@ -53,7 +53,7 @@ class Create(_FTPService):
     class SimpleIO(AdminSIO):
         request_elem = 'zato_outgoing_ftp_create_request'
         response_elem = 'zato_outgoing_ftp_create_response'
-        input_required = ('cluster_id', 'name', 'is_active', 'host', 'port', Boolean('dircache'))
+        input_required = ('cluster_id', 'name', 'is_active', 'host', 'port', Boolean('dircache'), Boolean('use_ftps'))
         input_optional = ('user', 'acct', 'timeout')
         output_required = ('id', 'name')
 
@@ -80,6 +80,7 @@ class Create(_FTPService):
                 item.user = input.user
                 item.acct = input.acct
                 item.timeout = input.timeout or None
+                item.use_ftps = input.use_ftps
 
                 session.add(item)
                 session.commit()
@@ -101,7 +102,7 @@ class Edit(_FTPService):
     class SimpleIO(AdminSIO):
         request_elem = 'zato_outgoing_ftp_edit_request'
         response_elem = 'zato_outgoing_ftp_edit_response'
-        input_required = ('id', 'cluster_id', 'name', 'is_active', 'host', 'port', Boolean('dircache'))
+        input_required = ('id', 'cluster_id', 'name', 'is_active', 'host', 'port', Boolean('dircache'), Boolean('use_ftps'))
         input_optional = ('user', 'acct', 'timeout')
         output_required = ('id', 'name')
 
@@ -129,6 +130,7 @@ class Edit(_FTPService):
                 item.user = input.user
                 item.acct = input.acct
                 item.timeout = input.timeout or None
+                item.use_ftps = input.use_ftps
 
                 input.password = item.password
                 input.old_name = old_name
