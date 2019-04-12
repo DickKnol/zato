@@ -1,12 +1,15 @@
 # -*- coding: utf-8 -*-
 
 """
-Copyright (C) 2014 Dariusz Suchojad <dsuch at zato.io>
+Copyright (C) 2019, Zato Source s.r.o. https://zato.io
 
 Licensed under LGPLv3, see LICENSE.txt for terms and conditions.
 """
 
 from __future__ import absolute_import, division, print_function, unicode_literals
+
+# Python 2/3 compatibility
+from six import add_metaclass
 
 # stdlib
 from contextlib import closing
@@ -21,34 +24,54 @@ from zato.common.util import ping_odoo
 from zato.server.service.internal import AdminService, AdminSIO, ChangePasswordBase
 from zato.server.service.meta import CreateEditMeta, DeleteMeta, GetListMeta
 
+# ################################################################################################################################
+
 elem = 'email_imap'
 model = OutgoingOdoo
 label = 'an Odoo connection'
+get_list_docs = 'Odoo connections'
 broker_message = OUTGOING
 broker_message_prefix = 'ODOO_'
 list_func = out_odoo_list
-skip_input_params = ['password']
+skip_input_params = ['password', 'client_type']
+
+# ################################################################################################################################
 
 def instance_hook(service, input, instance, attrs):
     if 'create' in service.get_name().lower():
         instance.password = uuid4().hex
 
+# ################################################################################################################################
+
 def broker_message_hook(service, input, instance, attrs, service_type):
     if service_type == 'create_edit':
         input.password = instance.password
 
+# ################################################################################################################################
+
+@add_metaclass(GetListMeta)
 class GetList(AdminService):
     _filter_by = OutgoingOdoo.name,
-    __metaclass__ = GetListMeta
 
+# ################################################################################################################################
+
+@add_metaclass(CreateEditMeta)
 class Create(AdminService):
-    __metaclass__ = CreateEditMeta
+    pass
 
+# ################################################################################################################################
+
+@add_metaclass(CreateEditMeta)
 class Edit(AdminService):
-    __metaclass__ = CreateEditMeta
+    pass
 
+# ################################################################################################################################
+
+@add_metaclass(DeleteMeta)
 class Delete(AdminService):
-    __metaclass__ = DeleteMeta
+    pass
+
+# ################################################################################################################################
 
 class ChangePassword(ChangePasswordBase):
     """ Changes the password of an Odoo connection
@@ -66,8 +89,11 @@ class ChangePassword(ChangePasswordBase):
         return self._handle(OutgoingOdoo, _auth, OUTGOING.ODOO_CHANGE_PASSWORD.value,
             publish_instance_attrs=['host', 'protocol', 'port', 'database', 'user', 'password', 'pool_size'])
 
-class Ping(AdminService):
+# ################################################################################################################################
 
+class Ping(AdminService):
+    """ Pings an Odoo connection to check its configuration.
+    """
     class SimpleIO(AdminSIO):
         request_elem = 'zato_outgoing_odoo_ping_request'
         response_elem = 'zato_outgoing_odoo_ping_response'
@@ -86,3 +112,5 @@ class Ping(AdminService):
             response_time = time() - start_time
 
             self.response.payload.info = 'Ping OK, took:`{0:03.4f} s`'.format(response_time)
+
+# ################################################################################################################################

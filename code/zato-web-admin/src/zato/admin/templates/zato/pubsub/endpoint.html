@@ -13,11 +13,12 @@
     <script type="text/javascript" src="/static/jquery/jquery.alerts.min.js"></script>
 
     <script type="text/javascript" src="/static/js/common.js"></script>
-    <script type="text/python" src="/static/brython/_zato/common.py"></script>
     <script type="text/javascript" src="/static/js/pubsub/endpoint.js"></script>
 
+    <script type="text/python" src="/static/brython/zato/common.py"></script>
+
     <script type="text/javascript">
-    window.zato_dyn_form_default = 'websockets';
+    window.zato_dyn_form_default = 'wsx';
     window.zato_dyn_form_elem_name = 'endpoint_type';
     window.zato_dyn_form_rows = {
         'amqp': [],
@@ -28,9 +29,9 @@
         'service': ['service_id'],
         'sms_twilio': [],
         'smtp': [],
-        'soap': ['security_id'],
+        'soap': [],
         'sql': [],
-        'websockets': ['ws_channel_id'],
+        'wsx': ['ws_channel_id'],
     }
     window.zato_dyn_form_in_use = {{ in_use|safe }}
     </script>
@@ -113,23 +114,35 @@
                         <td>{{ item.name }}</td>
                         <td>{{ item.role }}</td>
                         <td>{{ item.topic_patterns_html|safe|default:'<span class="form_hint">---</span>' }}</td>
-                        <td>{{ item.client_html|safe|default:'<span class="form_hint">---</span>' }}</td>
+                        <td>
+                            {% if item.client_html %}
+                                {{ item.client_html|safe }}
+                            {% else %}
+                                {{ item.endpoint_type|upper }}
+                            {% endif %}
+                        </td>
                         <td>
                             {% if 'pub' in item.role %}
-                                <a href="{% url "pubsub-endpoint-topics" cluster_id item.id item.name|slugify %}">Topics</a>
+                                <a href="{% url "pubsub-endpoint-topics" cluster_id item.id item.name|slugify %}?cluster={{ cluster_id }}">Topics</a>
                             {% else %}
                                 <span class="form_hint">---</span>
                             {% endif %}
                         </td>
                         <td>
                             {% if 'sub' in item.role %}
-                                <a href="{% url "pubsub-endpoint-queues" cluster_id item.id item.name|slugify %}">Queues</a>
+                                <a href="{% url "pubsub-endpoint-queues" cluster_id item.id item.name|slugify %}?cluster={{ cluster_id }}">Queues</a>
                             {% else %}
                                 <span class="form_hint">---</span>
                             {% endif %}
                         </td>
 
-                        <td><a href="javascript:$.fn.zato.pubsub.endpoint.edit('{{ item.id }}')">Edit</a></td>
+                        <td>
+                            {% if item.is_internal %}
+                                <span class="form_hint">Edit</span>
+                            {% else %}
+                                <a href="javascript:$.fn.zato.pubsub.endpoint.edit('{{ item.id }}')">Edit</a>
+                            {% endif %}
+                        </td>
                         <td>
                             {% if item.is_internal %}
                                 <span class="form_hint">Delete</span>

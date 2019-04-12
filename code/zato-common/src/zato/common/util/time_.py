@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 
 """
-Copyright (C) 2016 Dariusz Suchojad <dsuch at zato.io>
+Copyright (C) 2019, Zato Source s.r.o. https://zato.io
 
 Licensed under LGPLv3, see LICENSE.txt for terms and conditions.
 """
@@ -10,6 +10,7 @@ from __future__ import absolute_import, division, print_function, unicode_litera
 
 # stdlib
 from datetime import datetime, timedelta
+from time import time
 import logging
 
 # Arrow
@@ -17,6 +18,9 @@ import arrow
 
 # tzlocal
 from tzlocal import get_localzone
+
+# Python 2/3 compatibility
+from past.builtins import unicode
 
 # ################################################################################################################################
 
@@ -36,10 +40,11 @@ def datetime_to_ms(dt):
 
 # ################################################################################################################################
 
-def utcnow_as_ms(_datetime_to_ms=datetime_to_ms, _utcnow=datetime.utcnow):
-    """ Returns current UTC time in milliseconds since epoch.
+def utcnow_as_ms(_time=time):
+    """ Returns current UTC time in milliseconds since epoch. As of now, uses time.time but may eventually choose
+    to use alternative implementations on different systems.
     """
-    return _datetime_to_ms(_utcnow())
+    return _time()
 
 # ################################################################################################################################
 

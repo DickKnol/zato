@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 
 """
-Copyright (C) 2010 Dariusz Suchojad <dsuch at zato.io>
+Copyright (C) 2019, Zato Source s.r.o. https://zato.io
 
 Licensed under LGPLv3, see LICENSE.txt for terms and conditions.
 """
@@ -11,7 +11,7 @@ from __future__ import absolute_import, division, print_function, unicode_litera
 # stdlib
 import logging
 from copy import deepcopy
-from httplib import OK
+from http.client import OK
 from itertools import chain
 from traceback import format_exc
 
@@ -29,15 +29,27 @@ from lxml.objectify import deannotate, Element, ElementMaker, ObjectifiedElement
 # SQLAlchemy
 from sqlalchemy.util import KeyedTuple
 
+# Python 2/3 compatibility
+from builtins import bytes
+from future.utils import iteritems
+from past.builtins import basestring
+
 # Zato
 from zato.common import NO_DEFAULT_VALUE, PARAMS_PRIORITY, ParsingException, SIMPLE_IO, simple_types, TRACE1, ZatoException, \
      ZATO_OK
+from zato.common.odb.api import WritableKeyedTuple
 from zato.common.util import make_repr
 from zato.server.service.reqresp.sio import AsIs, convert_param, ForceType, ServiceInput, SIOConverter
 
+# ################################################################################################################################
+
 logger = logging.getLogger(__name__)
 
+# ################################################################################################################################
+
 NOT_GIVEN = 'ZATO_NOT_GIVEN'
+
+# ################################################################################################################################
 
 direct_payload = simple_types + (EtreeElement, ObjectifiedElement)
 
@@ -46,17 +58,20 @@ direct_payload = simple_types + (EtreeElement, ObjectifiedElement)
 class HTTPRequestData(object):
     """ Data regarding an HTTP request.
     """
-    def __init__(self):
+    def __init__(self, _Bunch=Bunch):
         self.method = None
-        self.GET = None
-        self.POST = None
+        self.GET = _Bunch()
+        self.POST = _Bunch()
+        self.path = None
+        self.params = _Bunch()
 
-    def init(self, wsgi_environ={}):
+    def init(self, wsgi_environ=None):
+        wsgi_environ = wsgi_environ or {}
         self.method = wsgi_environ.get('REQUEST_METHOD')
-
-        # Note tht we always require UTF-8
-        self.GET = wsgi_environ.get('zato.http.GET', {})
-        self.POST = wsgi_environ.get('zato.http.POST', {})
+        self.GET.update(wsgi_environ.get('zato.http.GET', {}))
+        self.POST.update(wsgi_environ.get('zato.http.POST', {}))
+        self.path = wsgi_environ.get('PATH_INFO')
+        self.params.update(wsgi_environ.get('zato.http.path_params', {}))
 
     def __repr__(self):
         return make_repr(self)
@@ -75,19 +90,24 @@ class AMQPRequestData(object):
 
 # ################################################################################################################################
 
-class WebSphereMQRequestData(object):
+class IBMMQRequestData(object):
     """ Metadata for IBM MQ requests.
     """
-    __slots__ = ('ctx', 'msg_id', 'correlation_id', 'timestamp', 'put_date', 'put_time', 'reply_to')
+    __slots__ = ('ctx', 'data', 'msg_id', 'correlation_id', 'timestamp', 'put_date', 'put_time', 'reply_to', 'mqmd')
 
     def __init__(self, ctx):
         self.ctx = ctx
+        self.data = ctx['data']
         self.msg_id = ctx['msg_id']
         self.correlation_id = ctx['correlation_id']
         self.timestamp = ctx['timestamp']
         self.put_date = ctx['put_date']
         self.put_time = ctx['put_time']
         self.reply_to = ctx['reply_to']
+        self.mqmd = ctx['mqmd']
+
+# Backward compatibility
+WebSphereMQRequestData = IBMMQRequestData
 
 # ################################################################################################################################
 
@@ -97,7 +117,7 @@ class Request(SIOConverter):
     __slots__ = ('logger', 'payload', 'raw_request', 'input', 'cid', 'has_simple_io_config',
         'simple_io_config', 'bool_parameter_prefixes', 'int_parameters',
         'int_parameter_suffixes', 'is_xml', 'data_format', 'transport',
-        '_wsgi_environ', 'channel_params', 'merge_channel_params', 'http', 'amqp', 'wmq')
+        '_wsgi_environ', 'channel_params', 'merge_channel_params', 'http', 'amqp', 'wmq', 'ibm_mq', 'enforce_string_encoding')
 
     def __init__(self, logger, simple_io_config=None, data_format=None, transport=None):
         self.logger = logger
@@ -119,9 +139,10 @@ class Request(SIOConverter):
         self.merge_channel_params = True
         self.params_priority = PARAMS_PRIORITY.DEFAULT
         self.amqp = None
-        self.wmq = None
+        self.wmq = self.ibm_mq = None
         self.encrypt_func = None
         self.encrypt_secrets = True
+        self.bytes_to_str_encoding = None
 
 # ################################################################################################################################
 
@@ -132,7 +153,9 @@ class Request(SIOConverter):
         self.encrypt_func = encrypt_func
 
         if is_sio:
-            self.init_flat_sio(cid, sio, data_format, transport, wsgi_environ, getattr(sio, 'input_required', []))
+            required_list = getattr(sio, 'input_required', [])
+            required_list = [required_list] if isinstance(required_list, basestring) else required_list
+            self.init_flat_sio(cid, sio, data_format, transport, wsgi_environ, required_list)
 
         # We merge channel params in if requested even if it's not SIO
         else:
@@ -141,7 +164,7 @@ class Request(SIOConverter):
 
 # ################################################################################################################################
 
-    def init_flat_sio(self, cid, sio, data_format, transport, wsgi_environ, required_list):
+    def init_flat_sio(self, cid, sio, data_format, transport, wsgi_environ, required_list, _sio_container=(tuple, list)):
         """ Initializes flat SIO requests, i.e. not list ones.
         """
         self.is_xml = data_format == SIMPLE_IO.FORMAT.XML
@@ -149,8 +172,10 @@ class Request(SIOConverter):
         self.transport = transport
         self._wsgi_environ = wsgi_environ
 
-        path_prefix = getattr(sio, 'request_elem', 'request')
         optional_list = getattr(sio, 'input_optional', [])
+        optional_list = optional_list if isinstance(optional_list, _sio_container) else [optional_list]
+
+        path_prefix = getattr(sio, 'request_elem', 'request')
         default_value = getattr(sio, 'default_value', NO_DEFAULT_VALUE)
         use_text = getattr(sio, 'use_text', True)
         use_channel_params_only = getattr(sio, 'use_channel_params_only', False)
@@ -161,12 +186,15 @@ class Request(SIOConverter):
             self.bool_parameter_prefixes = self.simple_io_config.get('bool_parameter_prefixes', [])
             self.int_parameters = self.simple_io_config.get('int_parameters', [])
             self.int_parameter_suffixes = self.simple_io_config.get('int_parameter_suffixes', [])
+            self.bytes_to_str_encoding = self.simple_io_config['bytes_to_str']['encoding']
         else:
             self.payload = self.raw_request
 
         required_params = {}
 
         if required_list:
+
+            required_list = required_list if isinstance(required_list, _sio_container) else [required_list]
 
             # Needs to check for this exact default value to prevent a FutureWarning in 'if not self.payload'
             if self.payload == '' and not self.channel_params:
@@ -184,7 +212,7 @@ class Request(SIOConverter):
         self.input.update(required_params)
         self.input.update(optional_params)
 
-        for param, value in self.channel_params.iteritems():
+        for param, value in iteritems(self.channel_params):
             if param not in self.input:
                 self.input[param] = value
 
@@ -198,16 +226,21 @@ class Request(SIOConverter):
 
         for param in params_to_visit:
             try:
+
                 param_name, value = convert_param(
                     self.cid, '' if use_channel_params_only else self.payload, param, self.data_format, is_required,
                     default_value, path_prefix, use_text, self.channel_params, self.has_simple_io_config,
                     self.bool_parameter_prefixes, self.int_parameters, self.int_parameter_suffixes,
                     True, self.encrypt_func, self.encrypt_secrets, self.params_priority)
+
+                if self.bytes_to_str_encoding and isinstance(value, bytes):
+                    value = value.decode(self.bytes_to_str_encoding)
+
                 params[param_name] = value
 
-            except Exception, e:
+            except Exception:
                 msg = 'Caught an exception, param:`{}`, params_to_visit:`{}`, has_simple_io_config:`{}`, e:`{}`'.format(
-                    param, params_to_visit, self.has_simple_io_config, format_exc(e))
+                    param, params_to_visit, self.has_simple_io_config, format_exc())
                 self.logger.error(msg)
                 raise ParsingException(msg)
 
@@ -249,18 +282,24 @@ class SimpleIOPayload(SIOConverter):
     All of the attributes are prefixed with zato_ so that they don't conflict with non-Zato data..
     """
     def __init__(self, zato_cid, data_format, required_list, optional_list, simple_io_config, response_elem, namespace,
-            output_repeated, skip_empty, ignore_skip_empty, allow_empty_required):
+            output_repeated, skip_empty, ignore_skip_empty, allow_empty_required, _sio_container=(tuple, list)):
         self.zato_cid = zato_cid
         self.zato_data_format = data_format
         self.zato_is_xml = self.zato_data_format == SIMPLE_IO.FORMAT.XML
         self.zato_output = []
+
+        required_list = required_list if isinstance(required_list, _sio_container) else [required_list]
+        optional_list = optional_list if isinstance(optional_list, _sio_container) else [optional_list]
+
         self.zato_required = [(True, name) for name in required_list]
         self.zato_optional = [(False, name) for name in optional_list]
+
         self.zato_output_repeated = output_repeated
         self.zato_skip_empty_keys = skip_empty
         self.zato_force_empty_keys = ignore_skip_empty
         self.zato_allow_empty_required = allow_empty_required
         self.zato_meta = {}
+        self.zato_bytes_to_str_encoding = simple_io_config['bytes_to_str']['encoding']
         self.bool_parameter_prefixes = simple_io_config.get('bool_parameter_prefixes', [])
         self.int_parameters = simple_io_config.get('int_parameters', [])
         self.int_parameter_suffixes = simple_io_config.get('int_parameter_suffixes', [])
@@ -285,7 +324,10 @@ class SimpleIOPayload(SIOConverter):
         self.zato_output_repeated = True
 
     def __setitem__(self, key, value):
-        setattr(self, key, value)
+        if isinstance(key, slice):
+            return self.__setslice__(key.start, key.stop, value)
+        else:
+            setattr(self, key, value)
 
     def __getitem__(self, key):
         return self.zato_output[key]
@@ -302,24 +344,30 @@ class SimpleIOPayload(SIOConverter):
                 name = name.name
             setattr(self, name, '')
 
-    def set_payload_attrs(self, attrs):
+    def set_payload_attrs(self, attrs, _keyed=(dict, WritableKeyedTuple, KeyedTuple)):
         """ Called when the user wants to set the payload to a bunch of attributes.
         """
         names = None
-        if isinstance(attrs, (dict, KeyedTuple)):
+        if isinstance(attrs, _keyed):
             names = attrs.keys()
         elif self._is_sqlalchemy(attrs):
-            names = attrs._sa_class_manager.keys()
+            names = [elem[0] for elem in attrs._sa_class_manager._all_sqla_attributes()]
 
         if not names:
             raise Exception('Could not get keys out of attrs:`{}`'.format(attrs))
 
         if isinstance(attrs, dict):
             for name in names:
-                setattr(self, name, attrs[name])
+                value = attrs[name]
+                if self.zato_bytes_to_str_encoding and isinstance(value, bytes):
+                    value = value.decode(self.zato_bytes_to_str_encoding)
+                setattr(self, name, value)
         else:
             for name in names:
-                setattr(self, name, getattr(attrs, name))
+                value = getattr(attrs, name)
+                if self.zato_bytes_to_str_encoding and isinstance(value, bytes):
+                    value = value.decode(self.zato_bytes_to_str_encoding)
+                setattr(self, name, value)
 
     def append(self, item):
         self.zato_output.append(item)
@@ -358,10 +406,10 @@ class SimpleIOPayload(SIOConverter):
             msg_item = (item.keys(), item)
         else:
             msg_item = item
-        return '{} elem:[{}] not found in item:[{}]'.format(
+        return '{} elem:`{}` not found in item:`{!r}`'.format(
             'Expected' if is_required else 'Optional', name, msg_item)
 
-    def getvalue(self, serialize=True):
+    def getvalue(self, serialize=True, _keyed_tuple=(WritableKeyedTuple, KeyedTuple)):
         """ Gets the actual payload's value converted to a string representing either XML or JSON.
         """
         if self.zato_is_xml:
@@ -384,9 +432,10 @@ class SimpleIOPayload(SIOConverter):
         if output:
 
             # All elements must be of the same type so it's OK to do it
-            is_sa_namedtuple = isinstance(output[0], KeyedTuple)
+            is_sa_namedtuple = isinstance(output[0], _keyed_tuple)
 
             for item in output:
+
                 if self.zato_is_xml:
                     out_item = Element('item')
                 else:
@@ -403,8 +452,8 @@ class SimpleIOPayload(SIOConverter):
                     if isinstance(name, ForceType):
                         name = name.name
 
-                    if isinstance(elem_value, basestring):
-                        elem_value = elem_value if isinstance(elem_value, unicode) else elem_value.decode('utf-8')
+                    if isinstance(elem_value, bytes):
+                        elem_value = elem_value.decode('utf-8')
 
                     if self.zato_is_xml:
                         setattr(out_item, name, elem_value)
@@ -440,53 +489,93 @@ class SimpleIOPayload(SIOConverter):
             return top
 
 # ################################################################################################################################
+# ################################################################################################################################
 
 class Outgoing(object):
-    """ A container for various outgoing connections a service can access. This
-    in fact is a thin wrapper around data fetched from the service's self.worker_store.
+    """ A container for various outgoing connections a service can access. This in fact is a thin wrapper around data
+    fetched from the service's self.worker_store.
     """
-    __slots__ = ('amqp', 'ftp', 'wmq', 'jms_wmq', 'odoo', 'plain_http', 'soap', 'sql', 'stomp', 'zmq', 'websockets', 'vault',
-        'sms')
+    __slots__ = ('amqp', 'ftp', 'ibm_mq', 'jms_wmq', 'wmq', 'odoo', 'plain_http', 'soap', 'sql', 'stomp', 'zmq', 'wsx', 'vault',
+        'sms', 'sap', 'sftp', 'ldap', 'mongodb', 'def_kafka')
 
     def __init__(self, amqp=None, ftp=None, jms_wmq=None, odoo=None, plain_http=None, soap=None, sql=None, stomp=None, zmq=None,
-        websockets=None, vault=None, sms=None):
+            wsx=None, vault=None, sms=None, sap=None, sftp=None, ldap=None, mongodb=None, def_kafka=None):
         self.amqp = amqp
         self.ftp = ftp
-        self.wmq = self.jms_wmq = jms_wmq # Backward compat with 2.0, self.wmq is not preferred
+        self.ibm_mq = self.wmq = self.jms_wmq = jms_wmq # Backward compat with 2.0, self.ibm_mq is now preferred
         self.odoo = odoo
         self.plain_http = plain_http
         self.soap = soap
         self.sql = sql
         self.stomp = stomp
         self.zmq = zmq
-        self.websockets = websockets
+        self.wsx = wsx
         self.vault = vault
         self.sms = sms
+        self.sap = sap
+        self.sftp = sftp
+        self.ldap = ldap
+        self.mongodb = mongodb
+        self.def_kafka = None
+
+# ################################################################################################################################
+# ################################################################################################################################
 
 class AWS(object):
     def __init__(self, s3=None):
         self.s3 = s3
 
+# ################################################################################################################################
+# ################################################################################################################################
+
 class OpenStack(object):
     def __init__(self, swift=None):
         self.swift = swift
 
+# ################################################################################################################################
+# ################################################################################################################################
+
 class Cloud(object):
     """ A container for cloud-related connections a service can establish.
     """
-    __slots__ = ('aws', 'openstack')
+    __slots__ = 'aws', 'openstack'
 
     def __init__(self, aws=None, openstack=None):
         self.aws = aws or AWS()
         self.openstack = openstack or OpenStack()
 
 # ################################################################################################################################
+# ################################################################################################################################
+
+class Definition(object):
+    """ A container for connection definitions a service has access to.
+    """
+    __slots__ = 'kafka',
+
+    def __init__(self, kafka=None):
+        # type: (dict)
+        self.kafka = kafka
+
+# ################################################################################################################################
+# ################################################################################################################################
+
+class InstantMessaging(object):
+    """ A container for Instant Messaging connections, e.g. Slack or Telegram.
+    """
+    __slots__ = 'slack', 'telegram'
+
+    def __init__(self, slack=None, telegram=None):
+        # type: (dict, dict)
+        self.slack = slack
+        self.telegram = telegram
+
+# ################################################################################################################################
+# ################################################################################################################################
 
 class Response(object):
     """ A response from the service's invocation.
     """
-    __slots__ = ('logger', 'result', 'result_details', '_payload', 'payload',
-        '_content_type', 'content_type', 'content_type_changed', 'content_encoding',
+    __slots__ = ('logger', 'result', 'result_details', '_payload', '_content_type', 'content_type_changed', 'content_encoding',
         'headers', 'status_code', 'data_format', 'simple_io_config', 'outgoing_declared')
 
     def __init__(self, logger, result=ZATO_OK, result_details='', payload='',
@@ -545,8 +634,13 @@ class Response(object):
 
     def init(self, cid, io, data_format, _not_given=NOT_GIVEN):
         self.data_format = data_format
+
         required_list = getattr(io, 'output_required', [])
+        required_list = [required_list] if isinstance(required_list, basestring) else required_list
+
         optional_list = getattr(io, 'output_optional', [])
+        optional_list = [optional_list] if isinstance(optional_list, basestring) else optional_list
+
         response_elem = getattr(io, 'response_elem', _not_given)
         response_elem = response_elem if response_elem != _not_given else 'response'
         namespace = getattr(io, 'namespace', '')

@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 
 """
-Copyright (C) 2012 Dariusz Suchojad <dsuch at zato.io>
+Copyright (C) 2019, Zato Source s.r.o. https://zato.io
 
 Licensed under LGPLv3, see LICENSE.txt for terms and conditions.
 """
@@ -15,7 +15,6 @@ from contextlib import closing
 from datetime import datetime, timedelta
 from heapq import nlargest
 from operator import itemgetter
-from sys import maxint
 
 # Bunch
 from bunch import Bunch
@@ -27,6 +26,10 @@ from dateutil.rrule import MINUTELY, rrule, rruleset
 
 # SciPy
 from scipy import stats as sp_stats
+
+# Python 2/3 compatibility
+from future.utils import iteritems
+from zato.common.py23_ import maxint
 
 # Zato
 from zato.common import KVDB, SECONDS_IN_DAY, StatsElem, ZatoException
@@ -76,10 +79,9 @@ class BaseAggregatingService(AdminService):
         if max_batch_size:
             batch_size = min(key_len, max_batch_size)
             if batch_size < key_len:
-                msg = ('batch_size:[{}] < key_len:[{}], max_batch_size:[{}], key:[{}], '
-                'consider decreasing the job interval or increasing the max_batch_size').format(
-                    batch_size, key_len, max_batch_size, key)
-                self.logger.warn(msg)
+                msg = 'batch_size:`%s` < key_len:`%s`, max_batch_size:`%s`, key:`%s`, ' \
+                'consider decreasing the job interval or increasing max_batch_size'
+                self.logger.warn(msg, batch_size, key_len, max_batch_size, key)
         else:
             batch_size = key_len
 
@@ -185,6 +187,8 @@ class BaseAggregatingService(AdminService):
 # ##############################################################################
 
 class ProcessRawTimes(BaseAggregatingService):
+    """ A low-level services that periodically process raw data collected for statistics.
+    """
     def handle(self):
 
         if not self.stats_enabled():
@@ -413,7 +417,7 @@ class StatsReturningService(AdminService):
                 # We can convert all the values to floats here to ease with computing
                 # all the stuff and convert them still to integers later on, when necessary.
                 key_values = Bunch(
-                    ((name, float(value)) for (name, value) in self.server.kvdb.conn.hgetall(key).items()))
+                    ((name, float(value)) for (name, value) in iteritems(self.server.kvdb.conn.hgetall(key))))
 
                 if key_values:
 
@@ -470,6 +474,7 @@ class GetByService(StatsReturningService):
         request_elem = 'zato_stats_get_by_service_request'
         response_elem = 'zato_stats_get_by_service_response'
         input_required = StatsReturningService.SimpleIO.input_required + ('service_id',)
+        input_optional = ('service_name',)
         output_optional = ('service_name', 'usage', 'mean', 'rate', 'time', 'usage_trend', 'mean_trend',
                     'min_resp_time', 'max_resp_time',)
 

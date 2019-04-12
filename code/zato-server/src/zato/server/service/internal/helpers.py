@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 
 """
-Copyright (C) 2018, Zato Source s.r.o. https://zato.io
+Copyright (C) 2019, Zato Source s.r.o. https://zato.io
 
 Licensed under LGPLv3, see LICENSE.txt for terms and conditions.
 """
@@ -9,9 +9,8 @@ Licensed under LGPLv3, see LICENSE.txt for terms and conditions.
 from __future__ import absolute_import, division, print_function, unicode_literals
 
 # stdlib
-from cStringIO import StringIO
+from io import StringIO
 from logging import DEBUG
-from pprint import pprint
 
 # Django
 import django
@@ -19,7 +18,9 @@ from django.conf import settings
 from django.template import Context, Template
 
 # Zato
+from zato.common.exception import Forbidden
 from zato.server.service import AsIs, Service
+from zato.server.service.internal.service import Invoke
 
 # Configure Django settings when the module is picked up
 if not settings.configured:
@@ -50,8 +51,66 @@ class InputLogger(Service):
 class RawRequestLogger(Service):
     """ Writes out self.request.raw_request to server logs.
     """
+    name = 'helpers.raw-request-logger'
+
     def handle(self):
-        self.logger.info('RCV raw: `%r`', self.request.raw_request)
+        self.logger.info('Received request: `%s`', self.request.raw_request)
+
+# ################################################################################################################################
+
+class IBMMQLogger(Service):
+    """ Writes out self.request.raw_request to server logs.
+    """
+    name = 'helpers.ibm-mq-logger'
+
+    def handle(self):
+        template = """
+***********************
+IBM MQ message received
+***********************
+MsgId: `{msg_id}`
+CorrelId: `{correlation_id}`
+Timestamp: `{timestamp}`
+PutDate: `{put_date}`
+PutTime: `{put_time}`
+ReplyTo: `{reply_to}`
+MQMD: `{mqmd!r}`
+-----------------------
+Data: `{data}`
+***********************
+"""
+
+        mq = self.request.ibm_mq
+        na = 'n/a'
+
+        try:
+            msg_id = mq.msg_id.decode('ascii')
+        except UnicodeDecodeError:
+            msg_id = repr(mq.msg_id)
+
+        if mq.correlation_id:
+            try:
+                correlation_id = mq.correlation_id.decode('ascii')
+            except UnicodeDecodeError:
+                correlation_id = repr(mq.correlation_id)
+        else:
+            correlation_id = na
+
+        info = {
+            'msg_id': msg_id,
+            'correlation_id': correlation_id,
+            'timestamp': mq.timestamp,
+            'put_date': mq.put_date,
+            'put_time': mq.put_time,
+            'reply_to': mq.reply_to or na,
+            'mqmd': str(mq.mqmd).splitlines(),
+            'data': self.request.raw_request,
+        }
+
+        msg = template.format(**info)
+        msg_out = msg.decode('utf8')
+
+        self.logger.info(msg_out)
 
 # ################################################################################################################################
 
@@ -85,7 +144,6 @@ class HTMLService(Service):
 
         if self.logger.isEnabledFor(DEBUG):
             buff = StringIO()
-            pprint(ctx, buff)
             self.logger.debug(buff.getvalue())
             buff.close()
 
@@ -110,7 +168,7 @@ class TLSLogger(Service):
 # ################################################################################################################################
 
 class WebSocketsGateway(Service):
-    """ Dispatches incoming requests to target services.
+    """ Dispatches incoming WebSocket requests to target services.
     """
     name = 'helpers.web-sockets-gateway'
 
@@ -119,7 +177,35 @@ class WebSocketsGateway(Service):
         input_optional = (AsIs('request'),)
 
     def handle(self):
+        self.wsgi_environ['zato.orig_channel'] = self.channel
         self.response.payload = self.invoke(self.request.input.service, self.request.input.request,
             wsgi_environ=self.wsgi_environ)
 
 # ################################################################################################################################
+
+class WebSocketsPubSubGateway(Service):
+    """ Dispatches incoming WebSocket publish/subscribe requests to target services.
+    """
+    name = 'helpers.web-sockets-pub-sub-gateway'
+
+    class SimpleIO:
+        input_required = ('service',)
+        input_optional = (AsIs('request'),)
+
+    def handle(self):
+
+        # Make sure this is one of allowed services that we are to invoke
+        if self.request.input.service not in self.server.fs_server_config.pubsub.wsx_gateway_service_allowed:
+            raise Forbidden(self.cid)
+
+        # All good, we can invoke this service
+        else:
+            self.response.payload = self.invoke(self.request.input.service, self.request.input.request,
+                wsgi_environ=self.wsgi_environ)
+
+# ################################################################################################################################
+
+class ServiceGateway(Invoke):
+    """ Service to invoke other services through.
+    """
+    name = 'helpers.service-gateway'

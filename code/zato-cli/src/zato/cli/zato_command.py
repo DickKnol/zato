@@ -2,12 +2,16 @@
 # -*- coding: utf-8 -*-
 
 """
-Copyright (C) 2010 Dariusz Suchojad <dsuch at zato.io>
+Copyright (C) 2019, Zato Source s.r.o. https://zato.io
 
 Licensed under LGPLv3, see LICENSE.txt for terms and conditions.
 """
 
 from __future__ import absolute_import, division, print_function, unicode_literals
+
+# Python 2/3 compatibility
+from future.standard_library import install_aliases
+install_aliases()
 
 # stdlib
 import argparse
@@ -17,9 +21,10 @@ import cloghandler
 cloghandler = cloghandler # For pyflakes
 
 # Zato
-from zato.cli import ca_create_ca as ca_create_ca_mod, ca_create_lb_agent as ca_create_lb_agent_mod, \
-     ca_create_server as ca_create_server_mod, ca_create_web_admin as ca_create_web_admin_mod, \
-     check_config as check_config_mod, component_version as component_version_mod, create_cluster as create_cluster_mod, \
+from zato.cli import apispec as apispec_mod, ca_create_ca as ca_create_ca_mod, ca_create_lb_agent as ca_create_lb_agent_mod, \
+     ca_create_scheduler as ca_create_scheduler_mod, ca_create_server as ca_create_server_mod, \
+     ca_create_web_admin as ca_create_web_admin_mod, check_config as check_config_mod, \
+     component_version as component_version_mod, create_cluster as create_cluster_mod, \
      create_lb as create_lb_mod, create_odb as create_odb_mod, create_scheduler as create_scheduler_mod, \
      create_server as create_server_mod, create_web_admin as create_web_admin_mod, crypto as crypto_mod, \
      delete_odb as delete_odb_mod, enmasse as enmasse_mod, FromConfig, info as info_mod, migrate as migrate_mod, \
@@ -52,6 +57,18 @@ def get_parser():
 
     subs = parser.add_subparsers()
 
+
+    #
+    # apispec
+    #
+    apispec = subs.add_parser(
+        'apispec',
+        description='API specifications generator',
+        parents=[base_parser])
+    apispec.set_defaults(command='apispec')
+    apispec.add_argument('path', help='Path to a Zato server')
+    add_opts(apispec, apispec_mod.APISpec.opts)
+
     #
     # ca
     #
@@ -69,6 +86,11 @@ def get_parser():
     ca_create_lb_agent.set_defaults(command='ca_create_lb_agent')
     ca_create_lb_agent.add_argument('path', help='Path to a CA directory')
     add_opts(ca_create_lb_agent, ca_create_lb_agent_mod.Create.opts)
+
+    ca_create_scheduler = ca_create_subs.add_parser('scheduler', description=ca_create_scheduler_mod.Create.__doc__, parents=[base_parser])
+    ca_create_scheduler.set_defaults(command='ca_create_scheduler')
+    ca_create_scheduler.add_argument('path', help='Path to a CA directory')
+    add_opts(ca_create_scheduler, ca_create_scheduler_mod.Create.opts)
 
     ca_create_server = ca_create_subs.add_parser('server', description=ca_create_server_mod.Create.__doc__, parents=[base_parser])
     ca_create_server.set_defaults(command='ca_create_server')
@@ -126,6 +148,10 @@ def get_parser():
     create_scheduler.set_defaults(command='create_scheduler')
     add_opts(create_scheduler, create_scheduler_mod.Create.opts)
 
+    create_key = create_subs.add_parser('secret_key', description=crypto_mod.CreateSecretKey.__doc__, parents=[base_parser])
+    create_key.set_defaults(command='create_secret_key')
+    add_opts(create_key, crypto_mod.CreateSecretKey.opts)
+
     create_server = create_subs.add_parser('server', description=create_server_mod.Create.__doc__, parents=[base_parser])
     create_server.add_argument('path', help='Path to an empty directory to install the server in')
     create_server.set_defaults(command='create_server')
@@ -140,6 +166,17 @@ def get_parser():
     create_web_admin.add_argument('path', help='Path to an empty directory to install a new web admin in')
     create_web_admin.set_defaults(command='create_web_admin')
     add_opts(create_web_admin, create_web_admin_mod.Create.opts)
+
+    #
+    # crypto
+    #
+    crypto = subs.add_parser('crypto', description='Cryptographic operations')
+    crypto_subs = crypto.add_subparsers()
+
+    crypto_create_secret_key = crypto_subs.add_parser('create-secret-key',
+        description=crypto_mod.CreateSecretKey.__doc__, parents=[base_parser])
+    crypto_create_secret_key.set_defaults(command='crypto_create_secret_key')
+    add_opts(crypto_create_secret_key, crypto_mod.CreateSecretKey.opts)
 
     #
     # decrypt
@@ -208,6 +245,15 @@ def get_parser():
     migrate.add_argument('path', help='Path to a Zato component')
     migrate.set_defaults(command='migrate')
     add_opts(migrate, migrate_mod.Migrate.opts)
+
+    #
+    # reset-totp-key
+    #
+    reset_totp_key = subs.add_parser('reset-totp-key',
+        description=web_admin_auth_mod.ResetTOTPKey.__doc__, parents=[base_parser])
+    reset_totp_key.add_argument('path', help='Path to web-admin')
+    reset_totp_key.set_defaults(command='reset_totp_key')
+    add_opts(reset_totp_key, web_admin_auth_mod.ResetTOTPKey.opts)
 
     #
     # quickstart

@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 
 """
-Copyright (C) 2018, Zato Source s.r.o. https://zato.io
+Copyright (C) 2019, Zato Source s.r.o. https://zato.io
 
 Licensed under LGPLv3, see LICENSE.txt for terms and conditions.
 """
@@ -19,9 +19,7 @@ from zato.common import DATA_FORMAT
 from zato.server.service import Service
 
 class Create(Service):
-    """ Behave like zato.hot-deploy.create, except support returning an empty
-    successful response in the case of a blank request payload, to allow
-    the IDE to test the server connection.
+    """ Like zato.hot-deploy.create but returns an empty string if input payload is empty to let IDEs test server connections.
     """
     class SimpleIO:
         request_elem = 'zato_ide_deploy_create_request'

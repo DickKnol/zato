@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 
 """
-Copyright (C) 2011 Dariusz Suchojad <dsuch at zato.io>
+Copyright (C) 2019, Zato Source s.r.o. https://zato.io
 
 Licensed under LGPLv3, see LICENSE.txt for terms and conditions.
 """
@@ -14,24 +14,32 @@ from django import forms
 # Zato
 from zato.admin.web.forms import add_security_select, add_select, add_services, SearchForm as _ChooseClusterForm, \
      DataFormatForm, INITIAL_CHOICES
-from zato.common import BATCH_DEFAULTS, DEFAULT_HTTP_PING_METHOD, DEFAULT_HTTP_POOL_SIZE, HTTP_SOAP_SERIALIZATION_TYPE, \
-     MISC, MSG_PATTERN_TYPE, PARAMS_PRIORITY, SIMPLE_IO, SOAP_VERSIONS, URL_PARAMS_PRIORITY, ZATO_NONE
+from zato.common import DEFAULT_HTTP_PING_METHOD, DEFAULT_HTTP_POOL_SIZE, HTTP_SOAP, HTTP_SOAP_SERIALIZATION_TYPE, \
+     MISC, PARAMS_PRIORITY, SIMPLE_IO, SOAP_VERSIONS, URL_PARAMS_PRIORITY, ZATO_NONE
+
+# ################################################################################################################################
 
 params_priority = (
     (PARAMS_PRIORITY.CHANNEL_PARAMS_OVER_MSG, 'URL over message'),
     (PARAMS_PRIORITY.MSG_OVER_CHANNEL_PARAMS, 'Message over URL'),
 )
 
+# ################################################################################################################################
+
 url_params_priority = (
     (URL_PARAMS_PRIORITY.QS_OVER_PATH, 'QS over path'),
     (URL_PARAMS_PRIORITY.PATH_OVER_QS, 'Path over QS'),
 )
 
+# ################################################################################################################################
+# ################################################################################################################################
+
 class CreateForm(DataFormatForm):
     name = forms.CharField(widget=forms.TextInput(attrs={'style':'width:100%'}))
     is_active = forms.BooleanField(required=False, widget=forms.CheckboxInput(attrs={'checked':'checked'}))
     host = forms.CharField(initial='http://', widget=forms.TextInput(attrs={'style':'width:100%'}))
-    url_path = forms.CharField(initial='/', widget=forms.TextInput(attrs={'style':'width:100%'}))
+    url_path = forms.CharField(initial='/', widget=forms.TextInput(attrs={'style':'width:70%'}))
+    match_slash = forms.BooleanField(required=False, widget=forms.CheckboxInput(attrs={'checked':'checked'}))
     merge_url_params_req = forms.BooleanField(required=False, widget=forms.CheckboxInput(attrs={'checked':'checked'}))
     url_params_pri = forms.ChoiceField(widget=forms.Select())
     params_pri = forms.ChoiceField(widget=forms.Select())
@@ -51,7 +59,9 @@ class CreateForm(DataFormatForm):
     transport = forms.CharField(widget=forms.HiddenInput())
     cache_id = forms.ChoiceField(widget=forms.Select())
     cache_expiry = forms.CharField(widget=forms.TextInput(attrs={'style':'width:20%'}), initial=0)
+    content_encoding = forms.CharField(widget=forms.TextInput(attrs={'style':'width:20%'}))
     data_formats_allowed = SIMPLE_IO.HTTP_SOAP_FORMAT
+    http_accept = forms.CharField(widget=forms.TextInput(attrs={'style':'width:100%'}), initial=HTTP_SOAP.ACCEPT.ANY)
 
     def __init__(self, security_list=[], sec_tls_ca_cert_list={}, cache_list=[], soap_versions=SOAP_VERSIONS,
             prefix=None, post_data=None, req=None):
@@ -66,7 +76,7 @@ class CreateForm(DataFormatForm):
             self.fields['params_pri'].choices.append([value, label])
 
         self.fields['serialization_type'].choices = []
-        for item in HTTP_SOAP_SERIALIZATION_TYPE:
+        for item in HTTP_SOAP_SERIALIZATION_TYPE():
             self.fields['serialization_type'].choices.append([item.id, item.name])
 
         self.fields['soap_version'].choices = []
@@ -87,10 +97,17 @@ class CreateForm(DataFormatForm):
         add_services(self, req)
         add_select(self, 'cache_id', cache_list)
 
+# ################################################################################################################################
+# ################################################################################################################################
+
 class EditForm(CreateForm):
     is_active = forms.BooleanField(required=False, widget=forms.CheckboxInput())
     merge_url_params_req = forms.BooleanField(required=False, widget=forms.CheckboxInput())
+    match_slash = forms.BooleanField(required=False, widget=forms.CheckboxInput())
     has_rbac = forms.BooleanField(required=False, widget=forms.CheckboxInput())
+
+# ################################################################################################################################
+# ################################################################################################################################
 
 class SearchForm(_ChooseClusterForm):
     connection = forms.CharField(widget=forms.HiddenInput())
@@ -102,24 +119,5 @@ class SearchForm(_ChooseClusterForm):
         self.initial['connection'] = data.get('connection') or ''
         self.initial['transport'] = data.get('transport') or ''
 
-class ReplacePatternsForm(forms.Form):
-    audit_repl_patt_type = forms.ChoiceField(widget=forms.Select())
-    pattern_list = forms.CharField(widget=forms.Textarea(attrs={'rows':13, 'cols':70}), required=False)
-    audit_max_payload = forms.CharField(widget=forms.TextInput(attrs={'style':'width:20%'}))
-
-    def __init__(self, initial=None):
-        super(ReplacePatternsForm, self).__init__(initial=initial)
-
-        self.fields['audit_repl_patt_type'].choices = []
-        self.fields['audit_repl_patt_type'].choices.append(['', '----------'])
-
-        for item in MSG_PATTERN_TYPE:
-            self.fields['audit_repl_patt_type'].choices.append([item.id, item.name])
-
-class AuditLogEntryList(forms.Form):
-    """ List of audit log entries for a given HTTP/SOAP object.
-    """
-    start = forms.CharField(widget=forms.TextInput(attrs={'style':'width:150px; height:19px'}))
-    stop = forms.CharField(widget=forms.TextInput(attrs={'style':'width:150px; height:19px'}))
-    current_batch = forms.CharField(initial=BATCH_DEFAULTS.PAGE_NO, widget=forms.TextInput(attrs={'style':'width:50px; height:19px'}))
-    batch_size = forms.CharField(initial=BATCH_DEFAULTS.SIZE, widget=forms.TextInput(attrs={'style':'width:50px; height:19px'}))
+# ################################################################################################################################
+# ################################################################################################################################

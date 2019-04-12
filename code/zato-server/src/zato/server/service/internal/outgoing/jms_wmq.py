@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 
 """
-Copyright (C) 2018, Zato Source s.r.o. https://zato.io
+Copyright (C) 2019, Zato Source s.r.o. https://zato.io
 
 Licensed under LGPLv3, see LICENSE.txt for terms and conditions.
 """
@@ -218,7 +218,7 @@ class Delete(AdminService):
 # ################################################################################################################################
 
 class SendMessage(AdminService):
-    """ Sends a message to an IBM MQ MQ queue.
+    """ Sends a message to an IBM MQ queue.
     """
     class SimpleIO(AdminSIO):
         request_elem = 'zato_outgoing_jms_wmq_send_message_request'
@@ -227,6 +227,6 @@ class SendMessage(AdminService):
         input_optional = _optional + ('reply_to', AsIs('correl_id'), AsIs('msg_id'))
 
     def handle(self):
-        self.server.send_wmq_message(self.request.input)
+        self.server.connector_ibm_mq.send_wmq_message(self.request.input)
 
 # ################################################################################################################################

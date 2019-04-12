@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 
 """
-Copyright (C) 2017, Zato Source s.r.o. https://zato.io
+Copyright (C) 2019, Zato Source s.r.o. https://zato.io
 
 Licensed under LGPLv3, see LICENSE.txt for terms and conditions.
 """
@@ -9,17 +9,14 @@ Licensed under LGPLv3, see LICENSE.txt for terms and conditions.
 from __future__ import absolute_import, division, print_function, unicode_literals
 
 # stdlib
-from copy import deepcopy
 from datetime import datetime, timedelta
-from errno import EADDRINUSE
-from httplib import BAD_REQUEST, INTERNAL_SERVER_ERROR, NOT_FOUND, responses
+from http.client import BAD_REQUEST, INTERNAL_SERVER_ERROR, NOT_FOUND, responses
 from logging import getLogger
-from socket import error as SocketError
+from threading import current_thread
 from traceback import format_exc
-from urlparse import urlparse
 
 # Bunch
-from bunch import bunchify
+from bunch import Bunch, bunchify
 
 # gevent
 from gevent import sleep, socket, spawn
@@ -33,23 +30,31 @@ from ws4py.websocket import WebSocket as _WebSocket
 from ws4py.server.geventserver import WSGIServer
 from ws4py.server.wsgiutils import WebSocketWSGIApplication
 
+# Python 2/3 compatibility
+from future.moves.urllib.parse import urlparse
+from past.builtins import basestring
+
 # Zato
 from zato.common import CHANNEL, DATA_FORMAT, ParsingException, PUBSUB, SEC_DEF_TYPE, WEB_SOCKET
 from zato.common.exception import Reportable
+from zato.common.pubsub import HandleNewMessageCtx, MSG_PREFIX, PubSubMessage
 from zato.common.util import new_cid
+from zato.common.util.hook import HookTool
+from zato.common.util.wsx import cleanup_wsx_client
 from zato.server.connection.connector import Connector
-from zato.server.connection.web_socket.msg import AuthenticateResponse, ClientInvokeRequest, ClientMessage, copy_forbidden, \
-     error_response, ErrorResponse, Forbidden, OKResponse
-from zato.server.pubsub.task import Message as TaskMessage, PubSubTool
+from zato.server.connection.web_socket.msg import AuthenticateResponse, InvokeClientRequest, ClientMessage, copy_forbidden, \
+     error_response, ErrorResponse, Forbidden, OKResponse, InvokeClientPubSubRequest
+from zato.server.pubsub.task import PubSubTool
 from zato.vault.client import VAULT
 
 # ################################################################################################################################
 
 logger = getLogger('zato_web_socket')
+logger_zato = getLogger('zato')
 
 # ################################################################################################################################
 
-http404 = b'{} {}'.format(NOT_FOUND, responses[NOT_FOUND])
+http404 = '{} {}'.format(NOT_FOUND, responses[NOT_FOUND])
 
 # ################################################################################################################################
 
@@ -58,6 +63,26 @@ _wsgi_drop_keys = ('ws4py.socket', 'wsgi.errors', 'wsgi.input')
 # ################################################################################################################################
 
 VAULT_TOKEN_HEADER=VAULT.HEADERS.TOKEN_RESPONSE
+
+# ################################################################################################################################
+
+hook_type_to_method = {
+    WEB_SOCKET.HOOK_TYPE.ON_CONNECTED: 'on_connected',
+    WEB_SOCKET.HOOK_TYPE.ON_DISCONNECTED: 'on_disconnected',
+    WEB_SOCKET.HOOK_TYPE.ON_PUBSUB_RESPONSE: 'on_pubsub_response',
+}
+
+# ################################################################################################################################
+
+class HookCtx(object):
+    __slots__ = ('hook_type', 'config', 'pub_client_id', 'ext_client_id', 'ext_client_name', 'connection_time', 'user_data',
+        'forwarded_for', 'forwarded_for_fqdn', 'peer_address', 'peer_host', 'peer_fqdn', 'peer_conn_info_pretty', 'msg')
+
+    def __init__(self, hook_type, *args, **kwargs):
+        self.hook_type = hook_type
+        for name in self.__slots__:
+            if name != 'hook_type':
+                setattr(self, name, kwargs.get(name))
 
 # ################################################################################################################################
 
@@ -78,28 +103,108 @@ class WebSocket(_WebSocket):
     """ Encapsulates information about an individual connection from a WebSocket client.
     """
     def __init__(self, container, config, _unusued_sock, _unusued_protocols, _unusued_extensions, wsgi_environ, **kwargs):
-        super(WebSocket, self).__init__(_unusued_sock, _unusued_protocols, _unusued_extensions, wsgi_environ, **kwargs)
+
+        # The object containing this WebSocket
         self.container = container
+
+        # Note: configuration object is shared by all WebSockets and any writes will be visible to all of them
         self.config = config
+
+        # For later reference
         self.initial_http_wsgi_environ = wsgi_environ
+
+        # Referred to soon enough so created here
+        self.pub_client_id = 'ws.{}'.format(new_cid())
+
+        super(WebSocket, self).__init__(_unusued_sock, _unusued_protocols, _unusued_extensions, wsgi_environ, **kwargs)
+
+    def _init(self):
+
+        # Python-level ID contains all the core details, our own ID and that of the thread (greenlet) that creates us
+        _current_thread = current_thread()
+        python_id = '{}.{}.{}'.format(hex(id(self)), _current_thread.name, hex(_current_thread.ident))
+
+        # Assign core attributes to this object before calling parent class
+        self.python_id = python_id
+
+        # Must be set here and then to True later on because our parent class may already want
+        # to accept connections, and we need to postpone their processing until we are initialized fully.
+        self._initialized = False
+
         self.has_session_opened = False
         self._token = None
         self.update_lock = RLock()
-        self.pub_client_id = 'ws.{}'.format(new_cid())
         self.ext_client_id = None
         self.ext_client_name = None
         self.connection_time = self.last_seen = datetime.utcnow()
         self.sec_type = self.config.sec_type
         self.pings_missed = 0
         self.pings_missed_threshold = self.config.get('pings_missed_threshold', 5)
+        self.user_data = Bunch() # Arbitrary user-defined data
+        self._disconnect_requested = False # Have we been asked to disconnect this client?
+
+        # Last the we received a ping response (pong) from our peer
         self.ping_last_response_time = None
 
+        #
+        # If the peer ever subscribes to a pub/sub topic we will periodically
+        # store in the ODB information about the last time the peer either sent
+        # or received anything from us. Note that we store it if:
+        #
+        # * The peer has at least one subscription, and
+        # * At least self.pubsub_interact_interval seconds elapsed since the last update
+        #
+        # And:
+        #
+        # * The peer received a pub/sub message, or
+        # * The peer sent a pub/sub message
+        #
+        # Or:
+        #
+        # * The peer did not send or receive anything, but
+        # * The peer correctly responds to ping messages
+        #
+        # Such a logic ensures that we do not overwhelm the database with frequent updates
+        # if the peer uses pub/sub heavily - it is costly to do it for each message.
+        #
+        # At the same time, if the peer does not receive or send anything but it is still connected
+        # (because it responds to ping) we set its SQL status too.
+        #
+        # All of this lets background processes clean up WSX clients that subscribe at one
+        # point but they are never seen again, which may (theoretically) happen if a peer disconnects
+        # in a way that does not allow for Zato to clean up its subscription status in the ODB.
+        #
+        self.pubsub_interact_interval = WEB_SOCKET.DEFAULT.INTERACT_UPDATE_INTERVAL
+        self.interact_last_updated = None
+        self.last_interact_source = None
+        self.interact_last_set = None
+
+        # Manages access to service hooks
+        if self.config.hook_service:
+
+            self.hook_tool = HookTool(self.config.parallel_server, HookCtx, hook_type_to_method, self.invoke_service)
+
+            self.on_connected_service_invoker = self.hook_tool.get_hook_service_invoker(
+                self.config.hook_service, WEB_SOCKET.HOOK_TYPE.ON_CONNECTED)
+
+            self.on_disconnected_service_invoker = self.hook_tool.get_hook_service_invoker(
+                self.config.hook_service, WEB_SOCKET.HOOK_TYPE.ON_DISCONNECTED)
+
+            self.on_pubsub_response_service_invoker = self.hook_tool.get_hook_service_invoker(
+                self.config.hook_service, WEB_SOCKET.HOOK_TYPE.ON_PUBSUB_RESPONSE)
+
+        else:
+            self.hook_tool = None
+            self.on_connected_service_invoker = None
+            self.on_disconnected_service_invoker = None
+            self.on_pubsub_response_service_invoker = None
+
         # For publish/subscribe over WSX
-        self.pubsub_tool = PubSubTool(config.parallel_server.worker_store.pubsub, self, PUBSUB.ENDPOINT_TYPE.WEB_SOCKETS.id,
-            self.deliver_pubsub_msg)
+        self.pubsub_tool = PubSubTool(self.config.parallel_server.worker_store.pubsub, self,
+            PUBSUB.ENDPOINT_TYPE.WEB_SOCKETS.id, self.deliver_pubsub_msg)
 
         # Active WebSocket client ID (WebSocketClient model, web_socket_client.id in SQL)
-        self.sql_ws_client_id = None
+        self._sql_ws_client_id = None
 
         # For tokens assigned externally independent of our WS-level self.token.
         # Such tokens will be generated by Vault, for instance.
@@ -123,15 +228,15 @@ class WebSocket(_WebSocket):
         if self.forwarded_for:
             self.forwarded_for_fqdn = socket.getfqdn(self.forwarded_for)
         else:
-            self.forwarded_for_fqdn = '(Unknown)'
+            self.forwarded_for_fqdn = WEB_SOCKET.DEFAULT.FQDN_UNKNOWN
 
-        _peer_fqdn = '(Unknown)'
+        _peer_fqdn = WEB_SOCKET.DEFAULT.FQDN_UNKNOWN
 
         try:
             self._peer_host = socket.gethostbyaddr(_peer_address[0])[0]
             _peer_fqdn = socket.getfqdn(self._peer_host)
-        except Exception, e:
-            logger.warn(format_exc(e))
+        except Exception:
+            logger.warn(format_exc())
         finally:
             self._peer_fqdn = _peer_fqdn
 
@@ -141,6 +246,11 @@ class WebSocket(_WebSocket):
             DATA_FORMAT.JSON: self.parse_json,
             DATA_FORMAT.XML: self.parse_xml,
         }[self.config.data_format]
+
+        # All set, we can process connections now
+        self._initialized = True
+
+# ################################################################################################################################
 
     @property
     def token(self):
@@ -157,22 +267,103 @@ class WebSocket(_WebSocket):
 
 # ################################################################################################################################
 
+    # This is a property so as to make it easier to add logging calls to observe what is getting and setting the value
+
+    @property
+    def sql_ws_client_id(self):
+        return self._sql_ws_client_id
+
+    @sql_ws_client_id.setter
+    def sql_ws_client_id(self, value):
+        self._sql_ws_client_id = value
+
+# ################################################################################################################################
+
+    def set_last_interaction_data(self, source, _now=datetime.utcnow, _interval=WEB_SOCKET.DEFAULT.INTERACT_UPDATE_INTERVAL):
+        """ Updates metadata regarding pub/sub about this WSX connection.
+        """
+        with self.update_lock:
+
+            # Local aliases
+            now = _now()
+
+            # Update last interaction metadata time for our peer
+            self.last_interact_source = source
+
+            # It is possible that we set the metadata the first time,
+            # in which case we will always invoke the service, having first stored current timestamp for later use.
+            if not self.interact_last_set:
+                self.interact_last_set = now
+                needs_services = True
+            else:
+
+                # We must have been already called before, in which case we execute services only if it is our time to do it.
+                needs_services = True if self.interact_last_updated + timedelta(minutes=_interval) < now else False
+
+            # Are we to invoke the services this time?
+            if needs_services:
+
+                now_formatted = now.isoformat()
+
+                pub_sub_request = {
+                    'sub_key': self.pubsub_tool.get_sub_keys(),
+                    'last_interaction_time': now_formatted,
+                    'last_interaction_type': self.last_interact_source,
+                    'last_interaction_details': self.get_peer_info_pretty(),
+                }
+
+                wsx_request = {
+                    'id': self.sql_ws_client_id,
+                    'last_seen': now_formatted,
+                }
+
+                logger.info('Setting pub/sub interaction metadata `%s`', pub_sub_request)
+                self.invoke_service('zato.pubsub.subscription.update-interaction-metadata', pub_sub_request)
+
+                logger.info('Setting WSX last seen `%s`', wsx_request)
+                self.invoke_service('zato.channel.web-socket.client.set-last-seen', wsx_request)
+
+                # Finally, store it for the future use
+                self.interact_last_updated = now
+
+# ################################################################################################################################
+
     def deliver_pubsub_msg(self, sub_key, msg):
+        """ Delivers one or more pub/sub messages to the connected WSX client.
+        """
+        ctx = {}
+
+        if isinstance(msg, PubSubMessage):
+            len_msg = 1
+        else:
+            len_msg = len(msg)
+            msg = msg[0] if len_msg == 1 else msg
 
         # A list of messages is given on input so we need to serialize each of them individually
         if isinstance(msg, list):
-            len_msg = len(msg)
-            data = [elem.to_external_dict() for elem in msg]
+            cid = new_cid()
+            data = []
+            for elem in msg:
+                data.append(elem.serialized if elem.serialized else elem.to_external_dict())
+                if elem.reply_to_sk:
+                    ctx_reply_to_sk = ctx.setdefault('', [])
+                    ctx_reply_to_sk.append(elem.reply_to_sk)
 
         # A single message was given on input
         else:
-            len_msg = 1
-            data = msg.to_external_dict()
+            cid = msg.pub_msg_id
+            data = msg.serialized if msg.serialized else msg.to_external_dict()
+            if msg.reply_to_sk:
+                ctx['reply_to_sk'] = msg.reply_to_sk
 
-        cid = new_cid()
-        logger.info('Delivering %d pub/sub message{} to sub_key `%s`'.format('s' if len_msg > 1 else ''), len_msg, sub_key)
+        logger.info('Delivering %d pub/sub message{} to sub_key `%s` (ctx:%s)'.format('s' if len_msg > 1 else ''),
+            len_msg, sub_key, ctx)
 
-        self.invoke_client(cid, data)
+        # Actually deliver messages
+        self.invoke_client(cid, data, ctx=ctx, _Class=InvokeClientPubSubRequest)
+
+        # We get here if there was no exception = we can update pub/sub metadata
+        self.set_last_interaction_data('pubsub.deliver_pubsub_msg')
 
 # ################################################################################################################################
 
@@ -191,15 +382,54 @@ class WebSocket(_WebSocket):
 
 # ################################################################################################################################
 
+    def get_peer_info_dict(self):
+        return {
+            'name': self.ext_client_name,
+            'ext_client_id': self.ext_client_id,
+            'forwarded_for_fqdn': self.forwarded_for_fqdn,
+            'peer_fqdn': self._peer_fqdn,
+            'pub_client_id': self.pub_client_id,
+            'python_id': self.python_id,
+            'sock': str(getattr(self, 'sock', '')),
+            'swc': self.sql_ws_client_id,
+        }
+
+# ################################################################################################################################
+
     def get_peer_info_pretty(self):
-        return 'name:`{}` id:`{}` fwd_for:`{}` peer:`{}` pub:`{}`'.format(
-            self.ext_client_name, self.ext_client_id, self.forwarded_for_fqdn, self._peer_fqdn, self.pub_client_id)
+        return 'name:`{}` id:`{}` fwd_for:`{}` conn:`{}` pub:`{}`, py:`{}`, sock:`{}`, swc:`{}`'.format(
+            self.ext_client_name, self.ext_client_id, self.forwarded_for_fqdn, self._peer_fqdn,
+            self.pub_client_id, self.python_id, getattr(self, 'sock', ''), self.sql_ws_client_id)
+
+# ################################################################################################################################
+
+    def get_on_connected_hook(self):
+        """ Returns a hook triggered when a new connection was made.
+        """
+        if self.hook_tool:
+            return self.on_connected_service_invoker
+
+# ################################################################################################################################
+
+    def get_on_disconnected_hook(self):
+        """ Returns a hook triggered when an existing connection was dropped.
+        """
+        if self.hook_tool:
+            return self.on_disconnected_service_invoker
+
+# ################################################################################################################################
+
+    def get_on_pubsub_hook(self):
+        """ Returns a hook triggered when a pub/sub response arrives from the connected client.
+        """
+        if self.hook_tool:
+            return self.on_pubsub_response_service_invoker
 
 # ################################################################################################################################
 
     def parse_json(self, data, _create_session=WEB_SOCKET.ACTION.CREATE_SESSION, _response=WEB_SOCKET.ACTION.CLIENT_RESPONSE):
 
-        parsed = loads(data)
+        parsed = loads(data.decode('utf8'))
         msg = ClientMessage()
 
         meta = parsed.get('meta', {})
@@ -218,11 +448,16 @@ class WebSocket(_WebSocket):
             if meta.get('client_id'):
                 self.ext_client_id = meta.client_id
 
-            if meta.get('client_name'):
-                self.ext_client_name = meta.client_name
+            ext_client_name = meta.get('client_name')
+            if ext_client_name:
+                if isinstance(ext_client_name, dict):
+                    _ext_client_name = []
+                    for key, value in sorted(ext_client_name.items()):
+                        _ext_client_name.append('{}: {}'.format(key, value))
+                    ext_client_name = '; '.join(_ext_client_name)
 
+            msg.ext_client_name = ext_client_name
             msg.ext_client_id = self.ext_client_id
-            msg.ext_client_name = self.ext_client_name
 
             if msg.action == _create_session:
                 msg.username = meta.get('username')
@@ -234,6 +469,11 @@ class WebSocket(_WebSocket):
             else:
                 msg.in_reply_to = meta.get('in_reply_to')
                 msg.is_auth = False
+
+                ctx = meta.get('ctx')
+                if ctx:
+                    msg.reply_to_sk = ctx.get('reply_to_sk')
+                    msg.deliver_to_sk = ctx.get('deliver_to_sk')
 
         msg.data = parsed.get('data', {})
 
@@ -281,6 +521,8 @@ class WebSocket(_WebSocket):
                 # Update peer name pretty now that we have more details about it
                 self.peer_conn_info_pretty = self.get_peer_info_pretty()
 
+                logger.info('Assigning wsx py:`%s` to `%s`', self.python_id, self.peer_conn_info_pretty)
+
             return AuthenticateResponse(self.token.value, request.cid, request.id).serialize()
 
 # ################################################################################################################################
@@ -288,8 +530,8 @@ class WebSocket(_WebSocket):
     def on_forbidden(self, action, data=copy_forbidden):
         cid = new_cid()
         logger.warn(
-            'Peer %s (%s) %s, closing its connection to %s (%s), cid:`%s`', self._peer_address, self._peer_fqdn, action,
-            self._local_address, self.config.name, cid)
+            'Peer %s (%s) %s, closing its connection to %s (%s), cid:`%s` (%s)', self._peer_address, self._peer_fqdn, action,
+            self._local_address, self.config.name, cid, self.peer_conn_info_pretty)
         self.send(Forbidden(cid, data).serialize())
 
         self.server_terminated = True
@@ -298,16 +540,23 @@ class WebSocket(_WebSocket):
 # ################################################################################################################################
 
     def send_background_pings(self, ping_extend=30):
+
+        logger.info('Starting WSX background pings for `%s`', self.peer_conn_info_pretty)
+
         try:
-            while self.stream:
+            while self.stream and (not self.server_terminated):
 
                 # Sleep for N seconds before sending a ping but check if we are connected upfront because
                 # we could have disconnected in between while and sleep calls.
                 sleep(ping_extend)
 
                 # Ok, still connected
-                if self.stream:
-                    response = self.invoke_client(new_cid(), None, False)
+                if self.stream and (not self.server_terminated):
+                    try:
+                        response = self.invoke_client(new_cid(), None, use_send=False)
+                    except RuntimeError:
+                        logger.warn('Closing connection due to `%s`', format_exc())
+                        self.on_socket_terminated()
 
                     with self.update_lock:
                         if response:
@@ -319,28 +568,43 @@ class WebSocket(_WebSocket):
                             self.pings_missed += 1
                             if self.pings_missed < self.pings_missed_threshold:
                                 logger.warn(
-                                    'Peer %s (%s) missed %s/%s ping messages from %s (%s). Last response time: %s{}'.format(
-                                        ' UTC' if self.ping_last_response_time else ''),
+                                    'Peer %s (%s) missed %s/%s ping messages from %s (%s). Last response time: %s{} (%s)'.format(
+                                        ' UTC' if self.ping_last_response_time else '', self.peer_conn_info_pretty),
                                     self._peer_address, self._peer_fqdn, self.pings_missed, self.pings_missed_threshold,
                                     self._local_address, self.config.name, self.ping_last_response_time)
                             else:
                                 self.on_forbidden('missed {}/{} ping messages'.format(
                                     self.pings_missed, self.pings_missed_threshold))
 
-                # No stream = already disconnected, we can quit
+                # No stream or server already = we can quit
                 else:
                     return
 
-        except Exception, e:
-            logger.warn(format_exc(e))
+        except Exception:
+            logger.warn(format_exc())
 
 # ################################################################################################################################
 
-    def register_auth_client(self):
+    def _get_hook_request(self):
+        out = bunchify({
+            'peer_address': self._peer_address,
+            'peer_host': self._peer_host,
+            'peer_fqdn': self._peer_fqdn,
+        })
+
+        for name in HookCtx.__slots__:
+            if name not in('hook_type', 'peer_address', 'peer_host', 'peer_fqdn', 'msg'):
+                out[name] = getattr(self, name)
+
+        return out
+
+# ################################################################################################################################
+
+    def register_auth_client(self, _assigned_msg='Assigned sws_id:`%s` to `%s` (%s %s %s)'):
         """ Registers peer in ODB and sets up background pings to keep its connection alive.
         Called only if authentication succeeded.
         """
-        self.sql_ws_client_id = self.invoke_service(new_cid(), 'zato.channel.web-socket.client.create', {
+        self.sql_ws_client_id = self.invoke_service('zato.channel.web-socket.client.create', {
             'pub_client_id': self.pub_client_id,
             'ext_client_id': self.ext_client_id,
             'ext_client_name': self.ext_client_name,
@@ -351,7 +615,18 @@ class WebSocket(_WebSocket):
             'connection_time': self.connection_time,
             'last_seen': self.last_seen,
             'channel_name': self.config.name,
+            'peer_forwarded_for': self.forwarded_for,
+            'peer_forwarded_for_fqdn': self.forwarded_for_fqdn,
         }, needs_response=True).ws_client_id
+
+        logger.info(
+            _assigned_msg, self.sql_ws_client_id, self.python_id, self.pub_client_id, self.ext_client_id, self.ext_client_name)
+
+        # Run the relevant on_connected hook, if any is available
+        hook = self.get_on_connected_hook()
+
+        if hook:
+            hook(**self._get_hook_request())
 
         spawn(self.send_background_pings)
 
@@ -360,22 +635,14 @@ class WebSocket(_WebSocket):
     def unregister_auth_client(self):
         """ Unregisters an already registered peer in ODB.
         """
-        if self.has_session_opened:
+        hook = self.get_on_disconnected_hook()
+        hook_request = self._get_hook_request() if hook else None
 
-            # Deletes state from SQL
-            self.invoke_service(new_cid(), 'zato.channel.web-socket.client.delete-by-pub-id', {
-                'pub_client_id': self.pub_client_id,
-            })
+        # To clear out our own delivery tasks
+        opaque_func_list = [self.pubsub_tool.remove_all_sub_keys]
 
-            if self.pubsub_tool.sub_keys:
-
-                # Deletes across all workers the in-RAM pub/sub state about the client that is disconnecting
-                self.invoke_service(new_cid(), 'zato.channel.web-socket.client.unregister-ws-sub-key', {
-                    'sub_key_list': list(self.pubsub_tool.sub_keys),
-                })
-
-                # Clears out our own delivery tasks
-                self.pubsub_tool.remove_all_sub_keys()
+        cleanup_wsx_client(self.has_session_opened, self.invoke_service, self.pub_client_id, list(self.pubsub_tool.sub_keys),
+            self.get_on_disconnected_hook(), self.config.hook_service, hook_request, opaque_func_list)
 
 # ################################################################################################################################
 
@@ -386,8 +653,8 @@ class WebSocket(_WebSocket):
                 self.register_auth_client()
                 self.send(response)
                 logger.info(
-                    'Client %s (%s %s) logged in successfully to %s (%s)', self._peer_address, self._peer_fqdn,
-                    self.pub_client_id, self._local_address, self.config.name)
+                    'Client %s logged in successfully to %s (%s) (%s)', self.pub_client_id, self._local_address,
+                    self.config.name, self.peer_conn_info_pretty)
             else:
                 self.on_forbidden('sent invalid credentials')
         else:
@@ -395,18 +662,24 @@ class WebSocket(_WebSocket):
 
 # ################################################################################################################################
 
-    def invoke_service(self, cid, service_name, data, needs_response=True, _channel=CHANNEL.WEB_SOCKET,
-            _data_format=DATA_FORMAT.DICT):
+    def invoke_service(self, service_name, data, cid=None, needs_response=True, _channel=CHANNEL.WEB_SOCKET,
+            _data_format=DATA_FORMAT.DICT, serialize=False):
+
+        # It is possible that this method will be invoked before self.__init__ completes,
+        # because self's parent manages the underlying TCP stream, in which can self
+        # will not be fully initialized yet so we need to wait a bit until it is.
+        while not self._initialized:
+            sleep(0.1)
 
         return self.config.on_message_callback({
-            'cid': cid,
+            'cid': cid or new_cid(),
             'data_format': _data_format,
             'service': service_name,
             'payload': data,
             'environ': {
                 'web_socket': self,
                 'sql_ws_client_id': self.sql_ws_client_id,
-            'ws_channel_config': self.config,
+                'ws_channel_config': self.config,
                 'ws_token': self.token,
                 'ext_token': self.ext_token,
                 'pub_client_id': self.pub_client_id,
@@ -422,7 +695,7 @@ class WebSocket(_WebSocket):
                 'forwarded_for_fqdn': self.forwarded_for_fqdn,
                 'initial_http_wsgi_environ': self.initial_http_wsgi_environ,
             },
-        }, CHANNEL.WEB_SOCKET, None, needs_response=needs_response, serialize=False)
+        }, CHANNEL.WEB_SOCKET, None, needs_response=needs_response, serialize=serialize)
 
 # ################################################################################################################################
 
@@ -434,11 +707,11 @@ class WebSocket(_WebSocket):
     def _handle_invoke_service(self, cid, msg):
 
         try:
-            service_response = self.invoke_service(cid, self.config.service_name, msg.data)
-        except Exception, e:
+            service_response = self.invoke_service(self.config.service_name, msg.data, cid=cid)
+        except Exception as e:
 
-            logger.warn('Service `%s` could not be invoked, id:`%s` cid:`%s`, e:`%s`',
-                self.config.service_name, msg.id, cid, format_exc(e))
+            logger.warn('Service `%s` could not be invoked, id:`%s` cid:`%s`, conn:`%s`, e:`%s`',
+                self.config.service_name, msg.id, cid, self.peer_conn_info_pretty, format_exc())
 
             # Errors known to map to HTTP ones
             if isinstance(e, Reportable):
@@ -453,7 +726,7 @@ class WebSocket(_WebSocket):
             # Anything else
             else:
                 status = INTERNAL_SERVER_ERROR
-                error_message = 'Could not invoke service `{}`, id:`{}`, cid:`{}`'.format(self.config.service_name, msg.id, cid)
+                error_message = 'Internal server error'
 
             response = ErrorResponse(cid, msg.id, status, error_message)
 
@@ -462,9 +735,17 @@ class WebSocket(_WebSocket):
 
         serialized = response.serialize()
 
-        logger.info('Sending response %s', serialized)
+        logger.info('Sending response `%s` from to `%s` `%s` `%s` `%s`', serialized,
+            self.python_id, self.pub_client_id, self.ext_client_id, self.ext_client_name, self.peer_conn_info_pretty)
 
-        self.send(serialized)
+        try:
+            self.send(serialized)
+        except AttributeError as e:
+            if e.message == "'NoneType' object has no attribute 'text_message'":
+                _msg = 'Service response discarded (client disconnected), cid:`%s`, msg.meta:`%s`'
+                _meta = msg.get_meta()
+                logger.warn(_msg, _meta)
+                logger_zato.warn(_msg, _meta)
 
 # ################################################################################################################################
 
@@ -484,13 +765,30 @@ class WebSocket(_WebSocket):
 
 # ################################################################################################################################
 
-    def _handle_client_response(self, cid, msg):
-        self.responses_received[msg.in_reply_to] = msg
+    def _handle_client_response(self, cid, msg, _msg_id_prefix=MSG_PREFIX.MSG_ID):
+        """ Processes responses from WSX clients - either invokes callbacks for pub/sub responses
+        or adds the message to the list of received ones because someone is waiting for it.
+        """
+        # Pub/sub response
+        if msg.in_reply_to.startswith(_msg_id_prefix):
+            hook = self.get_on_pubsub_hook()
+            if not hook:
+                log_msg = 'Ignoring pub/sub response, on_pubsub_response hook not implemented for `%s`, conn:`%s`, msg:`%s`'
+                logger.warn(log_msg, self.config.name, self.peer_conn_info_pretty, msg)
+                logger_zato.warn(log_msg, self.config.name, self.peer_conn_info_pretty, msg)
+            else:
+                request = self._get_hook_request()
+                request['msg'] = msg
+                hook(**request)
+
+        # Regular synchronous response, simply enqueue it and someone else will take care of it
+        else:
+            self.responses_received[msg.in_reply_to] = msg
 
     def _has_client_response(self, request_id):
         return self.responses_received.get(request_id)
 
-    def _wait_for_client_response(self, request_id, wait_time=1):
+    def _wait_for_client_response(self, request_id, wait_time=5):
         """ Wait until a response from client arrives and return it or return None if there is no response up to wait_time.
         """
         return self._wait_for_event(wait_time, self._has_client_response, request_id=request_id)
@@ -498,6 +796,12 @@ class WebSocket(_WebSocket):
 # ################################################################################################################################
 
     def _received_message(self, data, _now=datetime.utcnow, _default_data='', *args, **kwargs):
+
+        # This is one of methods that can be invoked before self.__init__ completes,
+        # because self's parent manages the underlying TCP stream, in which can self
+        # will not be fully initialized yet so we need to wait a bit until it is.
+        while not self._initialized:
+            sleep(0.1)
 
         try:
             request = self._parse_func(data or _default_data)
@@ -524,7 +828,15 @@ class WebSocket(_WebSocket):
                     return
 
                 # Ok, we can proceed
-                self.handle_client_message(cid, request) if not request.is_auth else self.handle_create_session(cid, request)
+                try:
+                    self.handle_client_message(cid, request) if not request.is_auth else self.handle_create_session(cid, request)
+                except RuntimeError as e:
+                    if e.message == 'Cannot send on a terminated websocket':
+                        msg = 'Ignoring message (client disconnected), cid:`%s`, request:`%s` conn:`%s`'
+                        logger.info(msg, cid, request, self.peer_conn_info_pretty)
+                        logger_zato.info(msg, cid, request, self.peer_conn_info_pretty)
+                    else:
+                        raise
 
             # Unauthenticated - require credentials on input
             else:
@@ -532,33 +844,37 @@ class WebSocket(_WebSocket):
 
             logger.info('Response returned cid:`%s`, time:`%s`', cid, _now()-now)
 
-        except Exception, e:
-            logger.warn(format_exc(e))
+        except Exception:
+            logger.warn(format_exc())
 
 # ################################################################################################################################
 
     def received_message(self, message):
-        logger.info('Received message %r', message.data)
+        logger.info('Received message %r to `%s` from `%s` `%s` `%s` `%s`', message.data,
+            self.python_id, self.pub_client_id, self.ext_client_id, self.ext_client_name, self.peer_conn_info_pretty)
+
         try:
-            spawn(self._received_message, deepcopy(message.data))
-        except Exception, e:
-            logger.warn(format_exc(e))
+            self._received_message(message.data)
+        except Exception:
+            logger.warn(format_exc())
 
 # ################################################################################################################################
 
     def notify_pubsub_message(self, cid, request):
-        """ Invoked by internal services each a pub/sub message is available for at least one of sub_keys
+        """ Invoked by internal services each time a pub/sub message is available for at least one of sub_keys
         this WSX client is responsible for.
         """
-        self.pubsub_tool.handle_new_messages(cid, request['has_gd'], request['sub_key_list'], request['non_gd_msg_list'])
+        self.pubsub_tool.handle_new_messages(HandleNewMessageCtx(cid, request['has_gd'], request['sub_key_list'],
+            request['non_gd_msg_list'], request['is_bg_call'], request['pub_time_max']))
 
 # ################################################################################################################################
 
     def run(self):
         try:
+            self._init()
             super(WebSocket, self).run()
-        except Exception, e:
-            logger.warn(format_exc(e))
+        except Exception:
+            logger.warn('Exception in WebSocket.run `%s`', format_exc())
 
 # ################################################################################################################################
 
@@ -575,33 +891,74 @@ class WebSocket(_WebSocket):
 
 # ################################################################################################################################
 
-    def invoke_client(self, cid, request, use_send=True):
+    def invoke_client(self, cid, request, timeout=5, ctx=None, use_send=True, _Class=InvokeClientRequest):
         """ Invokes a remote WSX client with request given on input, returning its response,
         if any was produced in the expected time.
         """
-        msg = ClientInvokeRequest(cid, request)
-        (self.send if use_send else self.ping)(msg.serialize())
+        # If input request is a string, try to decode it from JSON, but leave as-is in case
+        # of an error or if it is not a string.
+        if isinstance(request, basestring):
+            try:
+                request = loads(request)
+            except ValueError:
+                pass
 
-        response = self._wait_for_client_response(msg.id)
-        if response:
-            return response if isinstance(response, bool) else response.data # It will be bool in pong responses
+        # Serialize to string
+        msg = _Class(cid, request, ctx)
+        serialized = msg.serialize()
+
+        # Log what is about to be sent
+        if use_send:
+            logger.info('Sending message `%s` from `%s` to `%s` `%s` `%s` `%s`', serialized,
+                self.python_id, self.pub_client_id, self.ext_client_id, self.ext_client_name, self.peer_conn_info_pretty)
+
+        # Actually send the message now
+        (self.send if use_send else self.ping)(serialized)
+
+        # Wait for response but only if it is not a pub/sub message,
+        # these are always asynchronous and that channel's WSX hook
+        # will process the response, if any arrives.
+        if _Class is not InvokeClientPubSubRequest:
+            response = self._wait_for_client_response(msg.id, timeout)
+            if response:
+                return response if isinstance(response, bool) else response.data # It will be bool in pong responses
+
+# ################################################################################################################################
+
+    def _close_connection(self, verb, *_ignored_args, **_ignored_kwargs):
+        logger.info('{} %s (%s) to %s (%s %s %s%s'.format(verb),
+            self._peer_address, self._peer_fqdn, self._local_address, self.config.name, self.ext_client_id,
+            self.pub_client_id, ' {})'.format(self.ext_client_name) if self.ext_client_name else ')')
+
+        self.unregister_auth_client()
+        del self.container.clients[self.pub_client_id]
+
+# ################################################################################################################################
+
+    def disconnect_client(self, _ignored_cid=None):
+        """ Disconnects the remote client, cleaning up internal resources along the way.
+        """
+        self._disconnect_requested = True
+        self._close_connection('Disconnecting client from')
+        self.close()
 
 # ################################################################################################################################
 
     def opened(self, _now=datetime.utcnow, _timedelta=timedelta):
-        logger.info('New connection from %s (%s) to %s (%s)', self._peer_address, self._peer_fqdn,
-            self._local_address, self.config.name)
+        logger.info('New connection from %s (%s) to %s (%s %s %s)', self._peer_address, self._peer_fqdn,
+            self._local_address, self.config.name, self.python_id, self.sock)
 
         spawn(self._ensure_session_created)
 
 # ################################################################################################################################
 
-    def closed(self, code, reason=None):
-        logger.info('Closing connection from %s (%s) to %s (%s %s %s)',
-            self._peer_address, self._peer_fqdn, self._local_address, self.ext_client_id, self.config.name, self.pub_client_id)
+    def closed(self, _ignored_code=None, _ignored_reason=None):
 
-        self.unregister_auth_client()
-        del self.container.clients[self.pub_client_id]
+        # Our self.disconnect_client must have cleaned up everything already
+        if not self._disconnect_requested:
+            self._close_connection('Closing connection from')
+
+    on_socket_terminated = closed
 
 # ################################################################################################################################
 
@@ -610,7 +967,39 @@ class WebSocket(_WebSocket):
         # Pretend it's an actual response from the client,
         # we cannot use in_reply_to because pong messages are 1:1 copies of ping ones.
         # TODO: Use lxml for XML eventually but for now we are always using JSON
-        self.responses_received[_loads(msg.data)['meta']['id']] = True
+        self.responses_received[_loads(msg.data.decode('utf8'))['meta']['id']] = True
+
+        # Since we received a pong response, it means that the peer is connected,
+        # in which case we update its pub/sub metadata.
+        self.set_last_interaction_data('wsx.ponged')
+
+# ################################################################################################################################
+
+    def unhandled_error(self, e, _msg='Low-level exception caught, about to close connection from `%s`, e:`%s`'):
+        """ Called by the underlying WSX library when a low-level TCP/OS exception occurs.
+        """
+        peer_info = self.get_peer_info_pretty()
+        exc = format_exc()
+
+        logger.info(_msg, peer_info, exc)
+        logger_zato.info(_msg, peer_info, exc)
+
+        self.disconnect_client()
+
+    def close(self, code=1000, reason='', _msg='Error while closing connection from `%s`, e:`%s`'):
+        """ Re-implemented from the base class to be able to catch exceptions in self._write when closing connections.
+        """
+        if not self.server_terminated:
+            self.server_terminated = True
+            try:
+                self._write(self.stream.close(code=code, reason=reason).single(mask=self.stream.always_mask))
+            except Exception:
+
+                peer_info = self.get_peer_info_pretty()
+                exc = format_exc()
+
+                logger.info(_msg, peer_info, exc)
+                logger_zato.info(_msg, peer_info, exc)
 
 # ################################################################################################################################
 
@@ -627,8 +1016,8 @@ class WebSocketContainer(WebSocketWSGIApplication):
             self.clients[websocket.pub_client_id] = websocket
             environ['ws4py.websocket'] = websocket
             return websocket
-        except Exception, e:
-            logger.warn(format_exc(e))
+        except Exception:
+            logger.warn(format_exc())
 
     def __call__(self, environ, start_response):
 
@@ -638,14 +1027,20 @@ class WebSocketContainer(WebSocketWSGIApplication):
                 return [error_response[NOT_FOUND][self.config.data_format]]
 
             super(WebSocketContainer, self).__call__(environ, start_response)
-        except Exception, e:
-            logger.warn('Could not execute __call__, e:`%s`', format_exc(e))
+        except Exception:
+            logger.warn('Could not execute __call__, e:`%s`', format_exc())
 
-    def invoke_client(self, cid, pub_client_id, request):
-        return self.clients[pub_client_id].invoke_client(cid, request)
+    def invoke_client(self, cid, pub_client_id, request, timeout):
+        return self.clients[pub_client_id].invoke_client(cid, request, timeout)
+
+    def disconnect_client(self, cid, pub_client_id):
+        return self.clients[pub_client_id].disconnect_client(cid)
 
     def notify_pubsub_message(self, cid, pub_client_id, request):
         return self.clients[pub_client_id].notify_pubsub_message(cid, request)
+
+    def get_client_by_pub_id(self, pub_client_id):
+        return self.clients[pub_client_id]
 
 # ################################################################################################################################
 
@@ -667,11 +1062,46 @@ class WebSocketServer(WSGIServer):
 
         super(WebSocketServer, self).__init__((config.host, config.port), WebSocketContainer(config, handler_cls=WebSocket))
 
-    def invoke_client(self, cid, pub_client_id, request):
-        return self.application.invoke_client(cid, pub_client_id, request)
+# ################################################################################################################################
+
+    # These two methods are reimplemented from gevent.server to make it possible to use SO_REUSEPORT.
+
+    @classmethod
+    def get_listener(self, address, backlog=None, family=None):
+        if backlog is None:
+            backlog = self.backlog
+        return WebSocketServer._make_socket(address, backlog=backlog, reuse_addr=self.reuse_addr, family=family)
+
+    @staticmethod
+    def _make_socket(address, backlog=50, reuse_addr=None, family=socket.AF_INET):
+        sock = socket.socket(family=family)
+        if reuse_addr is not None:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, reuse_addr)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+        try:
+            sock.bind(address)
+        except socket.error as e:
+            strerror = getattr(e, 'strerror', None)
+            if strerror is not None:
+                e.strerror = strerror + ': ' + repr(address)
+            raise
+        sock.listen(backlog)
+        sock.setblocking(0)
+        return sock
+
+# ################################################################################################################################
+
+    def invoke_client(self, cid, pub_client_id, request, timeout):
+        return self.application.invoke_client(cid, pub_client_id, request, timeout)
+
+    def disconnect_client(self, cid, pub_client_id):
+        return self.application.disconnect_client(cid, pub_client_id)
 
     def notify_pubsub_message(self, cid, pub_client_id, request):
         return self.application.notify_pubsub_message(cid, pub_client_id, request)
+
+    def get_client_by_pub_id(self, pub_client_id):
+        return self.application.get_client_by_pub_id(pub_client_id)
 
 # ################################################################################################################################
 
@@ -683,13 +1113,7 @@ class ChannelWebSocket(Connector):
     def _start(self):
         self.server = WebSocketServer(self.config, self.auth_func, self.on_message_callback)
         self.is_connected = True
-        try:
-            self.server.serve_forever()
-        except SocketError, e:
-            if e.errno == EADDRINUSE:
-                logger.info('Ignoring EADDRINUSE for %s %s', self.config.address, e)
-            else:
-                raise
+        self.server.start()
 
     def _stop(self):
         self.server.stop(3)
@@ -697,10 +1121,16 @@ class ChannelWebSocket(Connector):
     def get_log_details(self):
         return self.config.address
 
-    def invoke(self, cid, pub_client_id, request):
-        return self.server.invoke_client(cid, pub_client_id, request)
+    def invoke(self, cid, pub_client_id, request, timeout=5):
+        return self.server.invoke_client(cid, pub_client_id, request, timeout)
+
+    def disconnect_client(self, cid, pub_client_id, *ignored_args, **ignored_kwargs):
+        return self.server.disconnect_client(cid, pub_client_id)
 
     def notify_pubsub_message(self, cid, pub_client_id, request):
         return self.server.notify_pubsub_message(cid, pub_client_id, request)
+
+    def get_client_by_pub_id(self, pub_client_id):
+        return self.server.get_client_by_pub_id(pub_client_id)
 
 # ################################################################################################################################

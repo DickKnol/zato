@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 
 """
-Copyright (C) 2018, Zato Source s.r.o. https://zato.io
+Copyright (C) 2019, Zato Source s.r.o. https://zato.io
 
 Licensed under LGPLv3, see LICENSE.txt for terms and conditions.
 """
@@ -98,23 +98,37 @@ class Create(AdminService):
                 input.password = uuid4().hex
                 input.use_jms = input.use_jms or False
 
-                def_ = ConnDefWMQ(None, input.name, input.host, input.port, input.queue_manager,
-                    input.channel, input.cache_open_send_queues, input.cache_open_receive_queues,
-                    input.use_shared_connections, input.ssl, input.ssl_cipher_spec,
-                    input.ssl_key_repository, input.needs_mcd, input.max_chars_printed,
-                    input.cluster_id, input.username, input.password, input.use_jms or False)
-                session.add(def_)
+                definition = self._new_zato_instance_with_cluster(ConnDefWMQ)
+                definition.name = input.name
+                definition.host = input.host
+                definition.port = input.port
+                definition.queue_manager = input.queue_manager
+                definition.channel = input.channel
+                definition.cache_open_send_queues = input.cache_open_send_queues
+                definition.cache_open_receive_queues = input.cache_open_receive_queues
+                definition.use_shared_connections = input.use_shared_connections
+                definition.ssl = input.ssl
+                definition.ssl_cipher_spec = input.ssl_cipher_spec
+                definition.ssl_key_repository = input.ssl_key_repository
+                definition.needs_mcd = input.needs_mcd
+                definition.max_chars_printed = input.max_chars_printed
+                definition.cluster_id = input.cluster_id
+                definition.username = input.username
+                definition.password = input.password
+                definition.use_jms = input.use_jms
+
+                session.add(definition)
                 session.commit()
 
-                input.id = def_.id
+                input.id = definition.id
                 input.action = DEFINITION.WMQ_CREATE.value
                 self.broker_client.publish(input)
 
-                self.response.payload.id = def_.id
-                self.response.payload.name = def_.name
+                self.response.payload.id = definition.id
+                self.response.payload.name = definition.name
 
             except Exception:
-                self.logger.error('Could not create an IBM MQ MQ definition, e:`%s`', format_exc())
+                self.logger.error('Could not create an IBM MQ definition, e:`%s`', format_exc())
                 session.rollback()
 
                 raise
@@ -122,7 +136,7 @@ class Create(AdminService):
 # ################################################################################################################################
 
 class Edit(AdminService):
-    """ Updates a WMQ definition.
+    """ Updates an IBM MQ definition.
     """
     class SimpleIO(AdminSIO):
         request_elem = 'zato_definition_jms_wmq_edit_request'
@@ -187,7 +201,7 @@ class Edit(AdminService):
 # ################################################################################################################################
 
 class Delete(AdminService):
-    """ Deletes an IBM MQ MQ definition.
+    """ Deletes an IBM MQ definition.
     """
     class SimpleIO(AdminSIO):
         request_elem = 'zato_definition_jms_wmq_delete_request'
@@ -216,7 +230,7 @@ class Delete(AdminService):
 # ################################################################################################################################
 
 class ChangePassword(ChangePasswordBase):
-    """ Changes the password of an IBM MQ MQ connection definition.
+    """ Changes the password of an IBM MQ connection definition.
     """
     password_required = False
 
@@ -243,7 +257,7 @@ class Ping(AdminService):
     def handle(self):
 
         start_time = datetime.utcnow()
-        self.server.ping_wmq(self.request.input.id)
+        self.server.connector_ibm_mq.ping_wmq(self.request.input.id)
         response_time = datetime.utcnow() - start_time
 
         self.response.payload.info = 'Ping OK, took:`{}` s'.format(response_time.total_seconds())

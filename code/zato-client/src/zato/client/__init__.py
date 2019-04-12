@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 
 """
-Copyright (C) 2013 Dariusz Suchojad <dsuch at zato.io>
+Copyright (C) 2019, Zato Source s.r.o. https://zato.io
 
 Licensed under LGPLv3, see LICENSE.txt for terms and conditions.
 """
@@ -9,13 +9,13 @@ Licensed under LGPLv3, see LICENSE.txt for terms and conditions.
 from __future__ import absolute_import, division, print_function, unicode_literals
 
 # stdlib
-import logging, os
+import logging
+import os
+from base64 import b64decode, b64encode
 from datetime import datetime
-from inspect import getargspec
+from http.client import OK
+from json import dumps, loads
 from traceback import format_exc
-
-# anyjson
-from anyjson import dumps as anyjson_dumps, loads
 
 # Bunch
 from bunch import bunchify
@@ -25,6 +25,10 @@ from lxml import objectify
 
 # requests
 import requests
+
+# Python 2/3 compatibility
+from builtins import str as text
+from six import PY3
 
 # Zato
 from zato.common import BROKER, soap_data_path, soap_data_xpath, soap_fault_xpath, \
@@ -42,26 +46,90 @@ DEFAULT_MAX_CID_REPR = 5
 
 mod_logger = logging.getLogger(__name__)
 
-# Work around https://bitbucket.org/runeh/anyjson/pull-request/4/
-if getargspec(anyjson_dumps).keywords:
-    dumps = anyjson_dumps
-else:
-    def dumps(data, *args, **kwargs):
-        return anyjson_dumps(data)
-
 # ################################################################################################################################
 # Version
 # ################################################################################################################################
 
-try:
-    curdir = os.path.dirname(os.path.abspath(__file__))
-    _version_py = os.path.normpath(os.path.join(curdir, '..', '..', '..', '..', '.version.py'))
-    _locals = {}
-    execfile(_version_py, _locals)
-    version = _locals['version']
-except IOError:
-    version = '2.0.3.4'
+version = '3.0.0'
 
+# ################################################################################################################################
+# ################################################################################################################################
+
+def default_json_handler(value):
+    if isinstance(value, datetime):
+        return value.isoformat()
+    elif isinstance(value, bytes):
+        return value.decode('utf8')
+    raise TypeError('Cannot serialize `{}`'.format(value))
+
+# ################################################################################################################################
+
+class _APIResponse(object):
+    """ A class to represent data returned by API services.
+    """
+    def __init__(self, inner, _OK=OK):
+        self.inner = inner
+        self.is_ok = self.inner.status_code == _OK
+        self.cid = self.inner.headers.get('x-zato-cid', '(None)')
+
+        if self.is_ok:
+            self.data = loads(self.inner.text)
+            self.details = None
+        else:
+            self.data = ''
+            self.details = self.inner.text
+
+# ################################################################################################################################
+
+class APIClient(object):
+    def __init__(self, address, username, password, path='/zato/api/invoke/{}', tls_verify=None, tls_cert=None):
+        self.address = address
+        self.username = username
+        self.password = password
+        self.path = path
+
+        self.tls_verify = tls_verify
+        self.tls_cert = tls_cert
+
+        self.session = requests.Session()
+        self.session.auth = (self.username, self.password)
+        self.session.verify = self.tls_verify
+        self.session.cert = self.tls_cert
+
+    def _invoke(self, verb, service_name, request=None):
+        func = getattr(self.session, verb)
+        url_path = self.path.format(service_name)
+        full_address = '{}{}'.format(self.address, url_path)
+        response = func(full_address, verify=self.tls_verify, data=dumps(request, default=default_json_handler))
+
+        return _APIResponse(response)
+
+    def invoke(self, *args, **kwargs):
+        return self._invoke('post', *args, **kwargs)
+
+    def get(self, *args, **kwargs):
+        return self._invoke('get', *args, **kwargs)
+
+    def post(self, *args, **kwargs):
+        return self._invoke('post', *args, **kwargs)
+
+    def patch(self, *args, **kwargs):
+        return self._invoke('patch', *args, **kwargs)
+
+    def put(self, *args, **kwargs):
+        return self._invoke('put', *args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        return self._invoke('delete', *args, **kwargs)
+
+    def by_verb(self, verb, *args, **kwargs):
+        return self._invoke(verb, *args, **kwargs)
+
+# ################################################################################################################################
+
+# Clients below are preserved only for compatibility with pre-3.0 environments and will be removed at one point
+
+# ################################################################################################################################
 # ################################################################################################################################
 
 class _Response(object):
@@ -112,8 +180,8 @@ class _StructuredResponse(_Response):
     def _set_data_details(self):
         try:
             self.data = self.load_func(self.inner.text.encode('utf-8'))
-        except Exception, e:
-            self.details = format_exc(e)
+        except Exception:
+            self.details = format_exc()
         else:
             return True
 
@@ -248,7 +316,10 @@ class ServiceInvokeResponse(JSONSIOResponse):
         response = payload.get('response')
         if response:
             if has_zato_env:
-                self.inner_service_response = payload['response'].decode('base64')
+                payload_response = payload['response']
+                payload_response = b64decode(payload_response)
+                payload_response = payload_response.decode('utf8') if isinstance(payload_response, bytes) else payload_response
+                self.inner_service_response = payload_response
                 try:
                     data = loads(self.inner_service_response)
                 except ValueError:
@@ -257,10 +328,10 @@ class ServiceInvokeResponse(JSONSIOResponse):
                 else:
                     if isinstance(data, dict):
                         self.meta = data.get('_meta')
-                        data_keys = data.keys()
+                        data_keys = list(data.keys())
                         if len(data_keys) == 1:
                             data_key = data_keys[0]
-                            if isinstance(data_key, basestring) and data_key.startswith('zato'):
+                            if isinstance(data_key, text) and data_key.startswith('zato'):
                                 self.data = data[data_key]
                             else:
                                 self.data = data
@@ -347,7 +418,7 @@ class _JSONClient(_Client):
 
     def invoke(self, payload='', headers=None, to_json=True):
         if to_json:
-            payload = dumps(payload)
+            payload = dumps(payload, default=default_json_handler)
         return super(_JSONClient, self).invoke(payload, self.response_class, headers=headers)
 
 class JSONClient(_JSONClient):
@@ -375,11 +446,6 @@ class AnyServiceInvoker(_Client):
     don't have to be available through any channels, it suffices for zato.service.invoke
     to be exposed over HTTP.
     """
-    def json_default_handler(self, value):
-        if isinstance(value, datetime):
-            return value.isoformat()
-        raise TypeError('Cannot serialize [{}]'.format(value))
-
     def _invoke(self, name=None, payload='', headers=None, channel='invoke', data_format='json',
                 transport=None, async=False, expiration=BROKER.DEFAULT_EXPIRATION, id=None,
                 to_json=True, output_repeated=ZATO_NOT_GIVEN, pid=None, all_pids=False, timeout=None):
@@ -391,13 +457,13 @@ class AnyServiceInvoker(_Client):
             output_repeated = name.lower().endswith('list')
 
         if to_json:
-            payload = dumps(payload, default=self.json_default_handler)
+            payload = dumps(payload, default=default_json_handler)
 
         id_, value = ('name', name) if name else ('id', id)
 
         request = {
             id_: value,
-            'payload': payload.encode('base64'),
+            'payload': b64encode(payload.encode('utf8') if PY3 else payload),
             'channel': channel,
             'data_format': data_format,
             'transport': transport,
@@ -408,7 +474,8 @@ class AnyServiceInvoker(_Client):
             'timeout': timeout,
         }
 
-        return super(AnyServiceInvoker, self).invoke(dumps(request), ServiceInvokeResponse, async, headers, output_repeated)
+        return super(AnyServiceInvoker, self).invoke(dumps(request, default=default_json_handler),
+            ServiceInvokeResponse, async, headers, output_repeated)
 
     def invoke(self, *args, **kwargs):
         return self._invoke(async=False, *args, **kwargs)
@@ -444,7 +511,8 @@ def get_client_from_server_conf(server_dir, client_auth_func, get_config_func, s
     """
 
     # To avoid circular references
-    from zato.common.util import get_crypto_manager_from_server_config, get_odb_session_from_server_config
+    from zato.common.crypto import ServerCryptoManager
+    from zato.common.util import get_odb_session_from_server_config
 
     class ZatoClient(AnyServiceInvoker):
         def __init__(self, *args, **kwargs):
@@ -453,14 +521,14 @@ def get_client_from_server_conf(server_dir, client_auth_func, get_config_func, s
             self.odb_session = None
 
     repo_dir = os.path.join(os.path.abspath(os.path.join(server_dir)), 'config', 'repo')
-    config = get_config_func(repo_dir, 'server.conf')
+    cm = ServerCryptoManager.from_repo_dir(None, repo_dir, None)
 
+    secrets_conf = get_config_func(repo_dir, 'secrets.conf', needs_user_config=False)
+    config = get_config_func(repo_dir, 'server.conf', crypto_manager=cm, secrets_conf=secrets_conf)
     server_url = server_url if server_url else config.main.gunicorn_bind
-    client = ZatoClient('http://{}'.format(server_url),
-        '/zato/admin/invoke', client_auth_func(config, repo_dir), max_response_repr=15000)
-
-    session = get_odb_session_from_server_config(
-        config, get_crypto_manager_from_server_config(config, repo_dir))
+    client_auth = client_auth_func(config, repo_dir, cm, False)
+    client = ZatoClient('http://{}'.format(server_url), '/zato/admin/invoke', client_auth, max_response_repr=15000)
+    session = get_odb_session_from_server_config(config, None, False)
 
     client.cluster_id = session.query(Server).\
         filter(Server.token == config.main.token).\
@@ -470,4 +538,5 @@ def get_client_from_server_conf(server_dir, client_auth_func, get_config_func, s
 
     return client
 
+# ################################################################################################################################
 # ################################################################################################################################

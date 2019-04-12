@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 
 """
-Copyright (C) 2014 Dariusz Suchojad <dsuch at zato.io>
+Copyright (C) 2019, Zato Source s.r.o. https://zato.io
 
 Licensed under LGPLv3, see LICENSE.txt for terms and conditions.
 """
@@ -10,6 +10,9 @@ from __future__ import absolute_import, division, print_function, unicode_litera
 
 # stdlib
 from contextlib import closing
+
+# Python 2/3 compatibility
+from six import add_metaclass
 
 # Zato
 from zato.common.broker_message import RBAC
@@ -21,6 +24,7 @@ from zato.server.service.meta import CreateEditMeta, DeleteMeta, GetListMeta
 elem = 'security_rbac_client_role'
 model = RBACClientRole
 label = 'an RBAC client role'
+get_list_docs = 'RBAC client roles'
 broker_message = RBAC
 broker_message_prefix = 'CLIENT_ROLE_'
 list_func = rbac_client_role_list
@@ -30,12 +34,16 @@ skip_input_params = ['name']
 extra_delete_attrs = ['client_def', 'role_id']
 check_existing_one = False
 
+# ################################################################################################################################
+
 def instance_hook(service, input, instance, attrs):
     with closing(service.odb.session()) as session:
         role = session.query(RBACRole).\
             filter(RBACRole.id==input.role_id).one()
 
     instance.name = '{}:::{}'.format(instance.client_def, role.name)
+
+# ################################################################################################################################
 
 def response_hook(service, input, instance, attrs, service_type):
     if service_type == 'get_list':
@@ -54,25 +62,28 @@ def response_hook(service, input, instance, attrs, service_type):
         service.response.payload.client_name = instance.client_def
         service.response.payload.role_name = role.name
 
+# ################################################################################################################################
+
+@add_metaclass(GetListMeta)
 class GetList(AdminService):
     _filter_by = RBACClientRole.name,
-    __metaclass__ = GetListMeta
 
+# ################################################################################################################################
+
+@add_metaclass(CreateEditMeta)
 class Create(AdminService):
-    __metaclass__ = CreateEditMeta
+    pass
 
-class Edit(AdminService):
-    """ This service is a no-op added only for API completeness.
-    """
-    def handle(self):
-        pass
+# ################################################################################################################################
 
+@add_metaclass(DeleteMeta)
 class Delete(AdminService):
-    __metaclass__ = DeleteMeta
+    pass
+
+# ################################################################################################################################
 
 class GetClientDefList(AdminService):
-    """ Returns a list of client definitions - both these that use Zato's built-in security mechanisms
-    as well as custom ones, as defined by users.
+    """ Returns a list of client definitions - Zato's built-in security mechanisms as well as custom ones, as defined by users.
     """
     class SimpleIO(AdminSIO):
         request_elem = 'zato_security_rbac_client_role_get_client_def_list_request'
@@ -102,3 +113,5 @@ class GetClientDefList(AdminService):
     def handle(self):
         with closing(self.odb.session()) as session:
             self.response.payload[:] = self.get_data(session)
+
+# ################################################################################################################################

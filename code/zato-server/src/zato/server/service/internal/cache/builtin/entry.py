@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 
 """
-Copyright (C) 2017, Zato Source s.r.o. https://zato.io
+Copyright (C) 2019, Zato Source s.r.o. https://zato.io
 
 Licensed under LGPLv3, see LICENSE.txt for terms and conditions.
 """
@@ -13,6 +13,10 @@ from arrow import get as arrow_get
 
 # Bunch
 from bunch import bunchify
+
+# Python 2/3 compatibility
+from future.utils import iteritems
+from past.builtins import basestring, long
 
 # Zato
 from zato.common import CACHE
@@ -41,14 +45,16 @@ class _Base(AdminService):
 # ################################################################################################################################
 
 class GetList(_Base):
+    """ Returns a list of entries from the cache given on input.
+    """
     _filter_by = ('name',)
 
     class SimpleIO(GetListAdminSIO):
         input_required = (AsIs('cache_id'),)
         input_optional = GetListAdminSIO.input_optional + (Int('max_chars'),)
         output_required = (AsIs('cache_id'), 'key', 'position', 'hits', 'expiry_op', 'expiry_left', 'expires_at',
-            'last_read', 'prev_read', 'last_write', 'prev_write', 'chars_omitted', 'server')
-        output_optional = ('value',)
+            'last_read', 'prev_read', 'last_write', 'prev_write', 'server')
+        output_optional = ('value', 'chars_omitted')
         output_repeated = True
 
 # ################################################################################################################################
@@ -132,7 +138,7 @@ class GetList(_Base):
         has_empty_key_criteria = len(key_criteria) == 0
         has_empty_value_criteria = len(value_criteria) == 0
 
-        for key, entry in cache.iteritems():
+        for key, entry in iteritems(cache):
 
             include_by_key = False
             include_by_value = False
@@ -215,11 +221,15 @@ class _CreateEdit(_Base):
 # ################################################################################################################################
 
 class Create(_CreateEdit):
+    """ Creates a new entry in the cache given on input.
+    """
     old_key_elem = 'key'
 
 # ################################################################################################################################
 
 class Update(_CreateEdit):
+    """ Updates an existing entry in the cache given on input.
+    """
     old_key_elem = 'old_key'
 
     class SimpleIO(_CreateEdit.SimpleIO):
@@ -237,7 +247,8 @@ class Update(_CreateEdit):
 # ################################################################################################################################
 
 class Get(_Base):
-
+    """ Returns an individual entry from the cache given on input.
+    """
     class SimpleIO(AdminSIO):
         input_required = ('cluster_id', 'cache_id', 'key')
         output_required = (Bool('key_found'),)
@@ -263,7 +274,8 @@ class Get(_Base):
 # ################################################################################################################################
 
 class Delete(_Base):
-
+    """ Deletes an entry from the cache given on input.
+    """
     class SimpleIO(AdminSIO):
         input_required = ('cluster_id', 'cache_id', 'key')
         output_required = (Bool('key_found'),)

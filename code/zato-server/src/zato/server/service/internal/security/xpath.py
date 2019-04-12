@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 
 """
-Copyright (C) 2013 Dariusz Suchojad <dsuch at zato.io>
+Copyright (C) 2019, Zato Source s.r.o. https://zato.io
 
 Licensed under LGPLv3, see LICENSE.txt for terms and conditions.
 """
@@ -22,7 +22,7 @@ from zato.common.util import validate_xpath
 from zato.server.service.internal import AdminService, AdminSIO, ChangePasswordBase, GetListAdminSIO
 
 class GetList(AdminService):
-    """ Returns a list of XPath security definitions available.
+    """ Returns a list of XPath-based security definitions available.
     """
     _filter_by = XPathSecurity.name,
 
@@ -48,7 +48,7 @@ class _CreateEdit(AdminService):
         validate_xpath(self.request.input.get('password_expr') or '/')
 
 class Create(_CreateEdit):
-    """ Creates a new XPath security definition.
+    """ Creates a new XPath-based security definition.
     """
     class SimpleIO(AdminSIO):
         request_elem = 'zato_security_xpath_create_request'
@@ -74,7 +74,7 @@ class Create(_CreateEdit):
                 if existing_one:
                     raise Exception('XPath security definition [{0}] already exists on this cluster'.format(input.name))
 
-                auth = XPathSecurity()
+                auth = self._new_zato_instance_with_cluster(XPathSecurity)
                 auth.name = input.name
                 auth.is_active = input.is_active
                 auth.username = input.username
@@ -86,9 +86,8 @@ class Create(_CreateEdit):
                 session.add(auth)
                 session.commit()
 
-            except Exception, e:
-                msg = 'Could not create an XPath security definition, e:[{e}]'.format(e=format_exc(e))
-                self.logger.error(msg)
+            except Exception:
+                self.logger.error('XPath security definition could not be created, e:`{}', format_exc())
                 session.rollback()
 
                 raise
@@ -102,7 +101,7 @@ class Create(_CreateEdit):
             self.response.payload.name = auth.name
 
 class Edit(_CreateEdit):
-    """ Updates an XPath security definition.
+    """ Updates an XPath-based security definition.
     """
     class SimpleIO(AdminSIO):
         request_elem = 'zato_security_xpath_edit_request'
@@ -136,9 +135,8 @@ class Edit(_CreateEdit):
                 session.add(auth)
                 session.commit()
 
-            except Exception, e:
-                msg = 'Could not update the XPath security definition, e:[{e}]'.format(e=format_exc(e))
-                self.logger.error(msg)
+            except Exception:
+                self.logger.error('XPath security definition could not be updated, e:`{}', format_exc())
                 session.rollback()
 
                 raise
@@ -152,7 +150,7 @@ class Edit(_CreateEdit):
                 self.response.payload.name = auth.name
 
 class ChangePassword(ChangePasswordBase):
-    """ Changes the password of an XPath security definition.
+    """ Changes the password of an XPath-based security definition.
     """
     password_required = False
 
@@ -167,7 +165,7 @@ class ChangePassword(ChangePasswordBase):
         return self._handle(XPathSecurity, _auth, SECURITY.XPATH_SEC_CHANGE_PASSWORD.value)
 
 class Delete(AdminService):
-    """ Deletes an XPath security definition.
+    """ Deletes an XPath-based security definition.
     """
     class SimpleIO(AdminSIO):
         request_elem = 'zato_security_xpath_delete_request'
@@ -183,8 +181,8 @@ class Delete(AdminService):
 
                 session.delete(auth)
                 session.commit()
-            except Exception, e:
-                msg = 'Could not delete the XPath security definition, e:[{e}]'.format(e=format_exc(e))
+            except Exception:
+                msg = 'Could not delete the XPath security definition, e:`{}`'.format(format_exc())
                 self.logger.error(msg)
                 session.rollback()
 

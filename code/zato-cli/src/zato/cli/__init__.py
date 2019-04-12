@@ -1,12 +1,17 @@
 # -*- coding: utf-8 -*-
 
 """
-Copyright (C) 2018, Zato Source s.r.o. https://zato.io
+Copyright (C) 2019, Zato Source s.r.o. https://zato.io
 
 Licensed under LGPLv3, see LICENSE.txt for terms and conditions.
 """
 
+from __future__ import absolute_import, division, print_function, unicode_literals
+
 # stdlib
+from builtins import input as raw_input, int
+from imp import reload
+from io import StringIO
 import json
 import logging
 import os
@@ -14,13 +19,9 @@ import shutil
 import sys
 import tempfile
 import time
-from cStringIO import StringIO
 from datetime import datetime
 from getpass import getpass, getuser
 from socket import gethostname
-
-# Importing
-from peak.util.imports import importString
 
 # SQLAlchemy
 import sqlalchemy
@@ -31,6 +32,7 @@ from zato.cli import util as cli_util
 from zato.common import odb, util, ZATO_INFO_FILE
 from zato.common.util import get_engine_url, get_full_stack, get_session
 from zato.common.util.cli import read_stdin_data
+from zato.common.util.import_ import import_string
 
 # ################################################################################################################################
 
@@ -102,6 +104,9 @@ loggers:
     '':
         level: INFO
         handlers: [stdout, default]
+    'gunicorn.main':
+        level: INFO
+        handlers: [stdout, default]
     zato:
         level: INFO
         handlers: [stdout, default]
@@ -134,7 +139,7 @@ loggers:
         propagate: false
     zato_pubsub:
         level: INFO
-        handlers: [pubsub]
+        handlers: [stdout, pubsub]
         qualname: zato_pubsub
         propagate: false
     zato_pubsub_overflow:
@@ -166,6 +171,11 @@ loggers:
         level: INFO
         handlers: [stdout, ibm_mq]
         qualname: zato_ibm_mq
+        propagate: false
+    zato_notif_sql:
+        level: INFO
+        handlers: [stdout, notif_sql]
+        qualname: zato_notif_sql
         propagate: false
 
 handlers:
@@ -264,6 +274,13 @@ handlers:
         mode: 'a'
         maxBytes: 20000000
         backupCount: 10
+    notif_sql:
+        formatter: default
+        class: logging.handlers.RotatingFileHandler
+        filename: './logs/notif-sql.log'
+        mode: 'a'
+        maxBytes: 20000000
+        backupCount: 10
 
 formatters:
     audit_pii:
@@ -310,8 +327,10 @@ ping_query=SELECT 1 FROM dual
 def run_command(args):
     command_class = {}
     command_imports = (
+        ('apispec', 'zato.cli.apispec.APISpec'),
         ('ca_create_ca', 'zato.cli.ca_create_ca.Create'),
         ('ca_create_lb_agent', 'zato.cli.ca_create_lb_agent.Create'),
+        ('ca_create_scheduler', 'zato.cli.ca_create_scheduler.Create'),
         ('ca_create_server', 'zato.cli.ca_create_server.Create'),
         ('ca_create_web_admin', 'zato.cli.ca_create_web_admin.Create'),
         ('check_config', 'zato.cli.check_config.CheckConfig'),
@@ -321,8 +340,10 @@ def run_command(args):
         ('create_odb', 'zato.cli.create_odb.Create'),
         ('create_scheduler', 'zato.cli.create_scheduler.Create'),
         ('create_server', 'zato.cli.create_server.Create'),
+        ('create_secret_key', 'zato.cli.crypto.CreateSecretKey'),
         ('create_user', 'zato.cli.web_admin_auth.CreateUser'),
         ('create_web_admin', 'zato.cli.create_web_admin.Create'),
+        ('crypto_create_secret_key', 'zato.cli.crypto.CreateSecretKey'),
         ('delete_odb', 'zato.cli.delete_odb.Delete'),
         ('decrypt', 'zato.cli.crypto.Decrypt'),
         ('encrypt', 'zato.cli.crypto.Encrypt'),
@@ -331,6 +352,7 @@ def run_command(args):
         ('hash_get_rounds', 'zato.cli.crypto.GetHashRounds'),
         ('info', 'zato.cli.info.Info'),
         ('migrate', 'zato.cli.migrate.Migrate'),
+        ('reset_totp_key', 'zato.cli.web_admin_auth.ResetTOTPKey'),
         ('quickstart_create', 'zato.cli.quickstart.Create'),
         ('service_invoke', 'zato.cli.service.Invoke'),
         ('update_crypto', 'zato.cli.crypto.UpdateCrypto'),
@@ -347,7 +369,7 @@ def run_command(args):
         ('update_password', 'zato.cli.web_admin_auth.UpdatePassword'),
     )
     for k, v in command_imports:
-        command_class[k] = importString(v)
+        command_class[k] = import_string(v)
 
     command_class[args.command](args).run(args)
 
@@ -514,7 +536,7 @@ class ZatoCommand(object):
                 'created_ts': datetime.utcnow().isoformat(), # noqa
                 'component': component
                 }
-        open(os.path.join(target_dir, ZATO_INFO_FILE), 'wb').write(json.dumps(info))
+        open(os.path.join(target_dir, ZATO_INFO_FILE), 'w').write(json.dumps(info))
 
 # ################################################################################################################################
 
@@ -626,7 +648,7 @@ class ZatoCommand(object):
             # https://github.com/zatosource/zato/issues/328
 
             return_code = self.execute(args)
-            if isinstance(return_code, (int, long)):
+            if isinstance(return_code, int):
                 sys.exit(return_code)
             else:
                 sys.exit(0)
@@ -659,8 +681,13 @@ class ZatoCommand(object):
     def _copy_crypto(self, repo_dir, args, middle_part):
         for name in('pub-key', 'priv-key', 'cert', 'ca-certs'):
             arg_name = '{}_path'.format(name.replace('-', '_'))
-            full_path = os.path.join(repo_dir, 'zato-{}-{}.pem'.format(middle_part, name))
-            shutil.copyfile(os.path.abspath(getattr(args, arg_name)), full_path)
+            target_path = os.path.join(repo_dir, 'zato-{}-{}.pem'.format(middle_part, name))
+
+            source_path = getattr(args, arg_name, None)
+            if source_path:
+                source_path = os.path.abspath(source_path)
+                if os.path.exists(source_path):
+                    shutil.copyfile(source_path, target_path)
 
 # ################################################################################################################################
 
@@ -693,7 +720,7 @@ class ZatoCommand(object):
 # ################################################################################################################################
 
     def get_odb_session_from_server_config(self, config, cm):
-        return cli_util.get_odb_session_from_server_config(config, cm)
+        return cli_util.get_odb_session_from_server_config(config, cm, False)
 
 # ################################################################################################################################
 
@@ -769,7 +796,7 @@ class CACreateCommand(ZatoCommand):
         template_args['common_name'] = self._get_arg(args, 'common_name', default_common_name)
         template_args['target_dir'] = self.target_dir
 
-        f = tempfile.NamedTemporaryFile() # noqa
+        f = tempfile.NamedTemporaryFile(mode='w+') # noqa
         f.write(openssl_template.format(**template_args))
         f.flush()
 
@@ -849,7 +876,7 @@ class CACreateCommand(ZatoCommand):
                 self.logger.info('OK')
 
         # Make sure permissions are tight (GH #440)
-        os.chmod(priv_key_name, 0640)
+        os.chmod(priv_key_name, 0o640)
 
         # In case someone needs to invoke us directly and wants to find out
         # what the format_args were.

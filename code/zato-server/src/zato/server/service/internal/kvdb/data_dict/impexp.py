@@ -1,15 +1,21 @@
 # -*- coding: utf-8 -*-
 
 """
-Copyright (C) 2012 Dariusz Suchojad <dsuch at zato.io>
+Copyright (C) 2019, Zato Source s.r.o. https://zato.io
 
 Licensed under LGPLv3, see LICENSE.txt for terms and conditions.
 """
 
 from __future__ import absolute_import, division, print_function, unicode_literals
 
+# stdlib
+from base64 import b64decode
+
 # anyjson
 from anyjson import loads
+
+# Python 2/3 compatibility
+from future.utils import iteritems
 
 # Zato
 from zato.common import KVDB
@@ -18,8 +24,7 @@ from zato.server.service.internal import AdminSIO
 from zato.server.service.internal.kvdb.data_dict import DataDictService
 
 class Import(DataDictService):
-    """ Imports a bz2-compressed JSON document containing data dictionaries replacing
-    any other existing ones.
+    """ Imports a bz2-compressed JSON document containing data dictionaries replacing any other existing ones.
     """
     class SimpleIO(AdminSIO):
         request_elem = 'zato_kvdb_data_dict_impexp_import_request'
@@ -27,7 +32,10 @@ class Import(DataDictService):
         input_required = ('data',)
 
     def handle(self):
-        data = loads(self.request.input.data.decode('base64').decode('bz2'))
+        data = self.request.input.data
+        data = b64decode(data)
+        data = data.decode('bz2')
+        data = loads(data)
         with self.server.kvdb.conn.pipeline() as p:
             p.delete(KVDB.DICTIONARY_ITEM_ID)
             p.delete(KVDB.DICTIONARY_ITEM)
@@ -50,7 +58,7 @@ class Import(DataDictService):
 
             for item in data['translation_list']:
                 key = item.keys()[0]
-                for value_key, value in item[key].items():
+                for value_key, value in iteritems(item[key]):
                     p.hset(key, value_key, value)
 
             p.execute()

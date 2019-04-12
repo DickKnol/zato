@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 
 """
-Copyright (C) 2012 Dariusz Suchojad <dsuch at zato.io>
+Copyright (C) 2019, Zato Source s.r.o. https://zato.io
 
 Licensed under LGPLv3, see LICENSE.txt for terms and conditions.
 """
@@ -19,29 +19,29 @@ from traceback import format_exc
 # anyjson
 from anyjson import dumps
 
-# pip
-from pip.download import is_archive_file
+# Python 2/3 compatibility
+from builtins import bytes
 
 # Zato
 from zato.common import DEPLOYMENT_STATUS, KVDB
 from zato.common.broker_message import HOT_DEPLOY
 from zato.common.odb.model import DeploymentPackage, DeploymentStatus
-from zato.common.util import fs_safe_now, is_python_file, new_cid
+from zato.common.util import fs_safe_now, is_python_file, is_archive_file, new_cid
+from zato.server.service import AsIs
 from zato.server.service.internal import AdminService, AdminSIO
 
 MAX_BACKUPS = 1000
 _first_prefix = '0' * (len(str(MAX_BACKUPS)) - 1) # So it runs from, e.g.,  000 to 999
 
 class Create(AdminService):
-    """ Creates all the needed filesystem directories and files out of a deployment
-    package stored in the ODB and starts all the services contained within the
-    package.
+    """ Creates all the filesystem directories and files out of a deployment package stored in the ODB.
     """
     class SimpleIO(AdminSIO):
         request_elem = 'zato_hot_deploy_create_request'
         response_elem = 'zato_hot_deploy_create_response'
         input_required = ('package_id',)
         input_optional = ('is_startup',)
+        output_optional = (AsIs('services_deployed'),)
 
     def _delete(self, items):
         for item in items:
@@ -50,8 +50,8 @@ class Create(AdminService):
             elif os.path.isdir(item):
                 shutil.rmtree(item)
             else:
-                msg = "Could not delete [{}], it's neither file nor a directory, stat:[{}]".format(item, os.stat(item))
-                self.logger.warn(msg)
+                msg = "Could not delete `%s`, it's neither file nor a directory, stat:`%s`"
+                self.logger.warn(msg, item, os.stat(item))
 
     def _backup_last(self, fs_now, current_work_dir, backup_format, last_backup_work_dir):
 
@@ -122,41 +122,46 @@ class Create(AdminService):
         self._backup_linear_log(fs_now, current_work_dir, backup_format, backup_work_dir, backup_history)
 
     def _deploy_file(self, current_work_dir, payload, file_name):
+
         f = open(file_name, 'w')
-        f.write(payload)
+        f.write(payload.decode('utf8') if isinstance(payload, bytes) else payload)
         f.close()
 
-        for service in self.server.service_store.import_services_from_file(file_name, False, current_work_dir):
+        services_deployed = []
+        info = self.server.service_store.import_services_from_anywhere(file_name, current_work_dir)
 
-            impl_name = self.server.service_store.name_to_impl_name[service.get_name()]
-            service_id = self.server.service_store.impl_name_to_id[impl_name]
+        for service in info.to_process:
+
+            service_id = self.server.service_store.impl_name_to_id[service.impl_name]
+            services_deployed.append(service_id)
 
             msg = {}
             msg['cid'] = new_cid()
-            msg['id'] = service_id
+            msg['service_id'] = service_id
+            msg['service_name'] = service.name
+            msg['service_impl_name'] = service.impl_name
             msg['action'] = HOT_DEPLOY.AFTER_DEPLOY.value
 
             self.broker_client.publish(msg)
 
-        return True
+        return services_deployed
 
     def _deploy_package(self, session, package_id, payload_name, payload):
         """ Deploy a package, either a plain Python file or an archive, and update
         the deployment status.
         """
-        success = False
         current_work_dir = self.server.hot_deploy_config.current_work_dir
-
         file_name = os.path.join(current_work_dir, payload_name)
-        success = self._deploy_file(current_work_dir, payload, file_name)
+        services_deployed = self._deploy_file(current_work_dir, payload, file_name)
 
-        if success:
+        if services_deployed:
             self._update_deployment_status(session, package_id, DEPLOYMENT_STATUS.DEPLOYED)
             msg = 'Uploaded package id:`%s`, payload_name:`%s`'
             self.logger.info(msg, package_id, payload_name)
+            return services_deployed
         else:
-            msg = 'Package id:`%s`, payload_name:`%s` has not been deployed'
-            self.logger.warn(msg, package_id, payload_name)
+            msg = 'No services were deployed from module `%s`'
+            self.logger.warn(msg, payload_name)
 
     def _update_deployment_status(self, session, package_id, status):
         ds = session.query(DeploymentStatus).\
@@ -173,7 +178,7 @@ class Create(AdminService):
         dp = self.get_package(package_id, session)
 
         if is_archive_file(dp.payload_name) or is_python_file(dp.payload_name):
-            self._deploy_package(session, package_id, dp.payload_name, dp.payload)
+            return self._deploy_package(session, package_id, dp.payload_name, dp.payload)
         else:
             # This shouldn't really happen at all because the pickup notifier is to
             # filter such things out but life is full of surprises
@@ -217,10 +222,10 @@ class Create(AdminService):
                         self.server.kvdb.conn.expire(already_deployed_flag, self.server.deployment_lock_expires)
 
                     # .. all workers get here.
-                    self.deploy_package(self.request.input.package_id, session)
+                    self.response.payload.services_deployed = self.deploy_package(self.request.input.package_id, session)
 
-                except(IOError, OSError), e:
+                except(IOError, OSError) as e:
                     if e.errno == ENOENT:
-                        self.logger.debug('Caught ENOENT e:`%s`', format_exc(e))
+                        self.logger.debug('Caught ENOENT e:`%s`', format_exc())
                     else:
                         raise

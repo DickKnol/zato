@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 
 """
-Copyright (C) 2011 Dariusz Suchojad <dsuch at zato.io>
+Copyright (C) 2019, Zato Source s.r.o. https://zato.io
 
 Licensed under LGPLv3, see LICENSE.txt for terms and conditions.
 """
@@ -38,7 +38,7 @@ class GetList(AdminService):
         response_elem = 'zato_outgoing_ftp_get_list_response'
         input_required = ('cluster_id',)
         output_required = ('id', 'name', 'is_active', 'host', 'port')
-        output_optional = ('user', 'acct', 'timeout', Boolean('dircache'))
+        output_optional = ('user', 'acct', 'timeout', Boolean('dircache'), Boolean('use_ftps'))
 
     def get_data(self, session):
         return self._search(out_ftp_list, session, self.request.input.cluster_id, False)
@@ -53,7 +53,7 @@ class Create(_FTPService):
     class SimpleIO(AdminSIO):
         request_elem = 'zato_outgoing_ftp_create_request'
         response_elem = 'zato_outgoing_ftp_create_response'
-        input_required = ('cluster_id', 'name', 'is_active', 'host', 'port', Boolean('dircache'))
+        input_required = ('cluster_id', 'name', 'is_active', 'host', 'port', Boolean('dircache'), Boolean('use_ftps'))
         input_optional = ('user', 'acct', 'timeout')
         output_required = ('id', 'name')
 
@@ -80,6 +80,7 @@ class Create(_FTPService):
                 item.user = input.user
                 item.acct = input.acct
                 item.timeout = input.timeout or None
+                item.use_ftps = input.use_ftps
 
                 session.add(item)
                 session.commit()
@@ -89,9 +90,8 @@ class Create(_FTPService):
                 self.response.payload.id = item.id
                 self.response.payload.name = item.name
 
-            except Exception, e:
-                msg = 'Could not create an outgoing FTP connection, e:[{e}]'.format(e=format_exc(e))
-                self.logger.error(msg)
+            except Exception:
+                self.logger.error('Could not create an outgoing FTP connection, e:`{}`', format_exc())
                 session.rollback()
 
                 raise
@@ -102,7 +102,7 @@ class Edit(_FTPService):
     class SimpleIO(AdminSIO):
         request_elem = 'zato_outgoing_ftp_edit_request'
         response_elem = 'zato_outgoing_ftp_edit_response'
-        input_required = ('id', 'cluster_id', 'name', 'is_active', 'host', 'port', Boolean('dircache'))
+        input_required = ('id', 'cluster_id', 'name', 'is_active', 'host', 'port', Boolean('dircache'), Boolean('use_ftps'))
         input_optional = ('user', 'acct', 'timeout')
         output_required = ('id', 'name')
 
@@ -130,6 +130,7 @@ class Edit(_FTPService):
                 item.user = input.user
                 item.acct = input.acct
                 item.timeout = input.timeout or None
+                item.use_ftps = input.use_ftps
 
                 input.password = item.password
                 input.old_name = old_name
@@ -142,9 +143,8 @@ class Edit(_FTPService):
                 self.response.payload.id = item.id
                 self.response.payload.name = item.name
 
-            except Exception, e:
-                msg = 'Could not update the outgoing FTP connection, e:[{e}]'.format(e=format_exc(e))
-                self.logger.error(msg)
+            except Exception:
+                self.logger.error('Could not update the outgoing FTP connection, e:`{}`', format_exc())
                 session.rollback()
 
                 raise
@@ -170,10 +170,9 @@ class Delete(_FTPService):
 
                 self.notify_worker_threads({'name':old_name}, OUTGOING.FTP_DELETE.value)
 
-            except Exception, e:
+            except Exception:
                 session.rollback()
-                msg = 'Could not delete the outgoing FTP connection, e:[{e}]'.format(e=format_exc(e))
-                self.logger.error(msg)
+                self.logger.error('Could not delete the outgoing FTP connection, e:`{}`', format_exc())
 
                 raise
 

@@ -1,32 +1,36 @@
 # -*- coding: utf-8 -*-
 
 """
-Copyright (C) 2017, Zato Source s.r.o. https://zato.io
+Copyright (C) 2019, Zato Source s.r.o. https://zato.io
 
 Licensed under LGPLv3, see LICENSE.txt for terms and conditions.
 """
 
 from __future__ import absolute_import, division, print_function, unicode_literals
 
+# Python 2/3 compatibility
+from six import add_metaclass
+
 # stdlib
 from contextlib import closing
-
-# SQLAlchemy
+from json import loads
 
 # Zato
 from zato.common import PUBSUB as COMMON_PUBSUB
 from zato.common.broker_message import PUBSUB
 from zato.common.exception import BadRequest, Conflict
-from zato.common.odb.model import PubSubEndpoint, PubSubEndpointEnqueuedMessage, PubSubEndpointTopic, PubSubMessage, \
-     PubSubSubscription, PubSubTopic
+from zato.common.odb.model import PubSubEndpoint, PubSubEndpointEnqueuedMessage, PubSubMessage, PubSubSubscription, PubSubTopic
 from zato.common.odb.query import count, pubsub_endpoint, pubsub_endpoint_list, pubsub_endpoint_queue, \
-     pubsub_endpoint_queue_list_by_sub_keys, pubsub_messages_for_queue, server_by_id
+     pubsub_messages_for_queue, server_by_id
 from zato.common.odb.query.pubsub.endpoint import pubsub_endpoint_summary, pubsub_endpoint_summary_list
 from zato.common.odb.query.pubsub.subscription import pubsub_subscription_list_by_endpoint_id
+from zato.common.pubsub import msg_pub_attrs
+from zato.common.util.pubsub import get_topic_sub_keys_from_sub_keys, make_short_msg_copy_from_msg
 from zato.common.util.time_ import datetime_from_ms
-from zato.server.service import AsIs, Int, List
+from zato.server.service import AsIs, Bool, Int, List
 from zato.server.service.internal import AdminService, AdminSIO, GetListAdminSIO
 from zato.server.service.internal.pubsub import common_sub_data
+from zato.server.service.internal.pubsub.search import NonGDSearchService
 from zato.server.service.meta import CreateEditMeta, DeleteMeta, GetListMeta
 
 # ################################################################################################################################
@@ -34,6 +38,7 @@ from zato.server.service.meta import CreateEditMeta, DeleteMeta, GetListMeta
 elem = 'pubsub_endpoint'
 model = PubSubEndpoint
 label = 'a pub/sub endpoint'
+get_list_docs = 'pub/sub endpoints'
 broker_message = PUBSUB
 broker_message_prefix = 'ENDPOINT_'
 list_func = pubsub_endpoint_list
@@ -42,9 +47,39 @@ output_optional_extra = ['ws_channel_name', 'sec_id', 'sec_type', 'sec_name', 's
 
 # ################################################################################################################################
 
+msg_pub_attrs_sio = []
+
+for name in msg_pub_attrs:
+    if name in ('topic', 'is_in_sub_queue', 'position_in_group', 'group_id'):
+        continue
+    elif name.endswith('_id'):
+        msg_pub_attrs_sio.append(AsIs(name))
+    elif name in ('position_in_group', 'priority', 'size', 'delivery_count'):
+        msg_pub_attrs_sio.append(Int(name))
+    elif name.startswith(('has_', 'is_')):
+        msg_pub_attrs_sio.append(Bool(name))
+    else:
+        msg_pub_attrs_sio.append(name)
+
+# ################################################################################################################################
+
+_meta_endpoint_key = COMMON_PUBSUB.REDIS.META_ENDPOINT_PUB_KEY
+
+# ################################################################################################################################
+
 _sub_skip_update = ('id', 'sub_id', 'sub_key', 'cluster_id', 'creation_time', 'current_depth', 'endpoint_id', 'endpoint_type',
     'last_interaction_time', 'staging_depth', 'sql_ws_client_id', 'topic_name', 'total_depth', 'web_socket',
     'out_rest_http_soap_id', 'out_soap_http_soap_id', 'out_http_soap_id')
+
+# ################################################################################################################################
+
+class _GetEndpointQueueMessagesSIO(GetListAdminSIO):
+    input_required = ('cluster_id',)
+    input_optional = GetListAdminSIO.input_optional + ('sub_id', 'sub_key')
+    output_required = (AsIs('msg_id'), 'recv_time')
+    output_optional = ('data_prefix_short', Int('delivery_count'), 'last_delivery_time', 'is_in_staging', 'queue_name',
+        'endpoint_id', 'sub_key', 'published_by_id', 'published_by_name', 'server_name', 'server_pid')
+    output_repeated = True
 
 # ################################################################################################################################
 
@@ -70,13 +105,15 @@ def broker_message_hook(self, input, instance, attrs, service_type):
 
 # ################################################################################################################################
 
+@add_metaclass(GetListMeta)
 class GetList(AdminService):
     _filter_by = PubSubEndpoint.name,
-    __metaclass__ = GetListMeta
 
 # ################################################################################################################################
 
 class Create(AdminService):
+    """ Creates a new pub/sub endpoint.
+    """
     class SimpleIO(AdminSIO):
         input_required = ('cluster_id', 'name', 'role', 'is_active', 'is_internal', 'endpoint_type')
         input_optional = ('topic_patterns', 'security_id', 'service_id', 'ws_channel_id')
@@ -121,17 +158,21 @@ class Create(AdminService):
 
 # ################################################################################################################################
 
+@add_metaclass(CreateEditMeta)
 class Edit(AdminService):
-    __metaclass__ = CreateEditMeta
+    pass
 
 # ################################################################################################################################
 
+@add_metaclass(DeleteMeta)
 class Delete(AdminService):
-    __metaclass__ = DeleteMeta
+    pass
 
 # ################################################################################################################################
 
 class Get(AdminService):
+    """ Returns details of a pub/sub endpoint.
+    """
     class SimpleIO:
         input_required = ('cluster_id', AsIs('id'))
         output_required = ('id', 'name', 'is_active', 'is_internal', 'role', 'endpoint_type')
@@ -147,73 +188,81 @@ class Get(AdminService):
 class GetTopicList(AdminService):
     """ Returns all topics to which a given endpoint published at least once.
     """
-    class SimpleIO:
+
+    class SimpleIO(AdminSIO):
         input_required = ('cluster_id', 'endpoint_id')
-        output_required = ('topic_id', 'name', 'is_active', 'is_internal', 'max_depth_gd', 'max_depth_non_gd')
-        output_optional = ('last_pub_time', AsIs('last_msg_id'), AsIs('last_correl_id'), 'last_in_reply_to',
-            AsIs('ext_client_id'))
+        output_required = ('topic_id', 'topic_name', 'pub_time', AsIs('pub_msg_id'), 'pub_pattern_matched', 'has_gd', 'data')
+        output_optional = (AsIs('pub_correl_id'), 'in_reply_to', AsIs('ext_client_id'), 'ext_pub_time')
         output_repeated = True
 
+# ################################################################################################################################
+
     def handle(self):
-        input = self.request.input
-        response = []
+        out = self.kvdb.conn.get(_meta_endpoint_key % (self.request.input.cluster_id, self.request.input.endpoint_id))
+        out = loads(out) if out else []
 
-        with closing(self.odb.session()) as session:
+        for elem in out:
+            elem['pub_time'] = datetime_from_ms(elem['pub_time'] * 1000.0)
+            if elem['ext_pub_time']:
+                elem['ext_pub_time'] = datetime_from_ms(elem['ext_pub_time'] * 1000.0)
 
-            # Get last pub time for that specific endpoint to this very topic
-            last_data = session.query(
-                PubSubTopic.id.label('topic_id'),
-                PubSubTopic.name, PubSubTopic.is_active,
-                PubSubTopic.is_internal, PubSubTopic.name,
-                PubSubTopic.max_depth_gd,
-                PubSubTopic.max_depth_non_gd,
-                PubSubEndpointTopic.last_pub_time,
-                PubSubEndpointTopic.pub_msg_id.label('last_msg_id'),
-                PubSubEndpointTopic.pub_correl_id.label('last_correl_id'),
-                PubSubEndpointTopic.in_reply_to.label('last_in_reply_to'),
-                PubSubEndpointTopic.ext_client_id,
-                ).\
-                filter(PubSubEndpointTopic.topic_id==PubSubTopic.id).\
-                filter(PubSubEndpointTopic.endpoint_id==input.endpoint_id).\
-                filter(PubSubEndpointTopic.cluster_id==self.request.input.cluster_id).\
-                all()
+        self.response.payload[:] = out
 
-            for item in last_data:
-                item.last_pub_time = datetime_from_ms(item.last_pub_time)
-                response.append(item)
+# ################################################################################################################################
 
-        self.response.payload[:] = response
+class GetEndpointQueueNonGDDepth(AdminService):
+    """ Returns current depth of non-GD messages for input sub_key which must have a delivery task on current server.
+    """
+    class SimpleIO(AdminSIO):
+        input_required = ('sub_key',)
+        output_optional = (Int('current_depth_non_gd'),)
+
+    def handle(self):
+        pubsub_tool = self.pubsub.get_pubsub_tool_by_sub_key(self.request.input.sub_key)
+        _, non_gd_depth = pubsub_tool.get_queue_depth(self.request.input.sub_key)
+        self.response.payload.current_depth_non_gd = non_gd_depth
 
 # ################################################################################################################################
 
 class _GetEndpointQueue(AdminService):
     def _add_queue_depths(self, session, item):
 
-        total_q = session.query(PubSubEndpointEnqueuedMessage.id).\
+        current_depth_gd_q = session.query(PubSubEndpointEnqueuedMessage.id).\
             filter(PubSubEndpointEnqueuedMessage.cluster_id==self.request.input.cluster_id).\
-            filter(PubSubEndpointEnqueuedMessage.subscription_id==item.sub_id)
+            filter(PubSubEndpointEnqueuedMessage.sub_key==item.sub_key).\
+            filter(PubSubEndpointEnqueuedMessage.is_in_staging != True).\
+            filter(PubSubEndpointEnqueuedMessage.delivery_status != COMMON_PUBSUB.DELIVERY_STATUS.DELIVERED)
 
-        current_q = session.query(PubSubEndpointEnqueuedMessage.id).\
-            filter(PubSubEndpointEnqueuedMessage.cluster_id==self.request.input.cluster_id).\
-            filter(PubSubEndpointEnqueuedMessage.subscription_id==item.sub_id).\
-            filter(PubSubEndpointEnqueuedMessage.is_in_staging != True)
+        # This could be read from the SQL database ..
+        item.current_depth_gd = count(session, current_depth_gd_q)
 
-        staging_q = session.query(PubSubEndpointEnqueuedMessage.id).\
-            filter(PubSubEndpointEnqueuedMessage.cluster_id==self.request.input.cluster_id).\
-            filter(PubSubEndpointEnqueuedMessage.subscription_id==item.sub_id).\
-            filter(PubSubEndpointEnqueuedMessage.is_in_staging == True)
+        # .. but non-GD depth needs to be collected from all the servers around. Note that the server may not be known
+        # in case the subscriber is a WSX client. In this case, by definition, there will be no non-GD messages for that client.
+        sk_server = self.pubsub.get_delivery_server_by_sub_key(item.sub_key)
 
-        total_depth = count(session, total_q)
-        current_depth = count(session, current_q)
-        staging_depth = count(session, staging_q)
+        if sk_server:
 
-        item.total_depth = total_depth
-        item.current_depth = current_depth
-        item.staging_depth = staging_depth
+            if sk_server.server_name == self.server.name and sk_server.server_pid == self.server.pid:
+                pubsub_tool = self.pubsub.get_pubsub_tool_by_sub_key(item.sub_key)
+                _, current_depth_non_gd = pubsub_tool.get_queue_depth(item.sub_key)
+            else:
+                response = self.servers[sk_server.server_name].invoke(GetEndpointQueueNonGDDepth.get_name(), {
+                    'sub_key': item.sub_key,
+                }, pid=sk_server.server_pid)
+                inner_response = response['response']
+                current_depth_non_gd = inner_response['current_depth_non_gd'] if inner_response else 0
+
+        # No delivery server = there cannot be any non-GD messages waiting for that subscriber
+        else:
+            current_depth_non_gd = 0
+
+        item.current_depth_non_gd = current_depth_non_gd
 
 # ################################################################################################################################
 
 class GetEndpointQueue(_GetEndpointQueue):
+    """ Returns information describing an individual endpoint queue.
+    """
     class SimpleIO(AdminSIO):
         input_required = ('cluster_id', 'id')
         output_optional = common_sub_data
@@ -221,20 +270,18 @@ class GetEndpointQueue(_GetEndpointQueue):
     def handle(self):
         with closing(self.odb.session()) as session:
             item = pubsub_endpoint_queue(session, self.request.input.cluster_id, self.request.input.id)
-
-            self._add_queue_depths(session, item)
-            item.creation_time = datetime_from_ms(item.creation_time)
-            if item.last_interaction_time:
-                item.last_interaction_time = datetime_from_ms(item.last_interaction_time)
-
+            item.creation_time = datetime_from_ms(item.creation_time * 1000.0)
+            if getattr(item, 'last_interaction_time', None):
+                item.last_interaction_time = datetime_from_ms(item.last_interaction_time * 1000.0)
             self.response.payload = item
+            self._add_queue_depths(session, self.response.payload)
 
 # ################################################################################################################################
 
 class GetEndpointQueueList(_GetEndpointQueue):
     """ Returns all queues to which a given endpoint is subscribed.
     """
-    _filter_by = PubSubTopic.name,
+    _filter_by = PubSubTopic.name, PubSubSubscription.sub_key
 
     class SimpleIO(GetListAdminSIO):
         input_required = ('cluster_id', 'endpoint_id')
@@ -249,16 +296,17 @@ class GetEndpointQueueList(_GetEndpointQueue):
 
     def handle(self):
         response = []
-
         with closing(self.odb.session()) as session:
-
             for item in self.get_data(session):
-
                 self._add_queue_depths(session, item)
-                item.creation_time = datetime_from_ms(item.creation_time)
+                item.creation_time = datetime_from_ms(item.creation_time * 1000.0)
 
                 if item.last_interaction_time:
-                    item.last_interaction_time = datetime_from_ms(item.last_interaction_time)
+                    item.last_interaction_time = datetime_from_ms(item.last_interaction_time * 1000.0)
+
+                if item.last_interaction_details:
+                    item.last_interaction_details = item.last_interaction_details.decode('utf8')
+
                 response.append(item)
 
         self.response.payload[:] = response
@@ -284,6 +332,9 @@ class UpdateEndpointQueue(AdminService):
         if out_rest_http_soap_id and out_soap_http_soap_id:
             raise BadRequest(self.cid, 'Cannot provide both out_rest_http_soap_id and out_soap_http_soap_id on input')
 
+        # WebSockets clients dynamic attach to delivery servers hence the servers cannot be updated by users
+        can_update_delivery_server = self.request.input.endpoint_type != COMMON_PUBSUB.ENDPOINT_TYPE.WEB_SOCKETS.id
+
         # We know we don't have both out_rest_http_soap_id and out_soap_http_soap_id on input
         # but we still need to find out if we have any at all.
         if out_rest_http_soap_id:
@@ -299,13 +350,15 @@ class UpdateEndpointQueue(AdminService):
                 filter(PubSubSubscription.cluster_id==self.request.input.cluster_id).\
                 one()
 
-            old_delivery_server_id = item.server_id
-            new_delivery_server_id = self.request.input.server_id
-            new_delivery_server_name = server_by_id(session, self.server.cluster_id, new_delivery_server_id).name
+            if can_update_delivery_server:
+                old_delivery_server_id = item.server_id
+                new_delivery_server_id = self.request.input.server_id
+                new_delivery_server_name = server_by_id(session, self.server.cluster_id, new_delivery_server_id).name
 
             for key, value in sorted(self.request.input.items()):
                 if key not in _sub_skip_update:
-                    setattr(item, key, value)
+                    if value is not None:
+                        setattr(item, key, value)
 
             # This one we set manually based on logic at the top of the method
             item.out_http_soap_id = out_http_soap_id
@@ -316,16 +369,22 @@ class UpdateEndpointQueue(AdminService):
             self.response.payload.id = self.request.input.id
             self.response.payload.name = item.topic.name
 
+            # Notify all processes, including our own, that this subscription's parameters have changed
+            updated_params_msg = item.asdict()
+            updated_params_msg['action'] = PUBSUB.SUBSCRIPTION_EDIT.value
+            self.broker_client.publish(updated_params_msg)
+
             # We change the delivery server in background - note how we send name, not ID, on input.
             # This is because our invocation target will want to use self.servers[server_name].invoke(...)
-            if old_delivery_server_id != new_delivery_server_id:
-                self.broker_client.publish({
-                    'sub_key': self.request.input.sub_key,
-                    'endpoint_type': item.endpoint.endpoint_type,
-                    'old_delivery_server_id': old_delivery_server_id,
-                    'new_delivery_server_name': new_delivery_server_name,
-                    'action': PUBSUB.DELIVERY_SERVER_CHANGE.value,
-                })
+            if can_update_delivery_server:
+                if old_delivery_server_id != new_delivery_server_id:
+                    self.broker_client.publish({
+                        'sub_key': self.request.input.sub_key,
+                        'endpoint_type': item.endpoint.endpoint_type,
+                        'old_delivery_server_id': old_delivery_server_id,
+                        'new_delivery_server_name': new_delivery_server_name,
+                        'action': PUBSUB.DELIVERY_SERVER_CHANGE.value,
+                    })
 
 # ################################################################################################################################
 
@@ -333,7 +392,7 @@ class ClearEndpointQueue(AdminService):
     """ Clears messages from the queue given on input.
     """
     class SimpleIO(AdminSIO):
-        input_required = ('cluster_id', 'id')
+        input_required = ('cluster_id', 'sub_key')
         input_optional = ('queue_type',)
 
     def handle(self, _queue_type=COMMON_PUBSUB.QUEUE_TYPE):
@@ -356,7 +415,7 @@ class ClearEndpointQueue(AdminService):
         with closing(self.odb.session()) as session:
             q = session.query(PubSubEndpointEnqueuedMessage).\
                 filter(PubSubEndpointEnqueuedMessage.cluster_id==self.request.input.cluster_id).\
-                filter(PubSubEndpointEnqueuedMessage.subscription_id==self.request.input.id)
+                filter(PubSubEndpointEnqueuedMessage.sub_key==self.request.input.sub_key)
 
             if is_in_staging is not None:
                 q = q.filter(PubSubEndpointEnqueuedMessage.is_in_staging.is_(is_in_staging))
@@ -389,25 +448,24 @@ class DeleteEndpointQueue(AdminService):
             sub_key_list = [sub_key] # Otherwise, we already had sub_key_list on input so 'else' is not needed
 
         cluster_id = self.request.input.cluster_id
-        topic_sub_keys = {}
 
         with closing(self.odb.session()) as session:
 
             # First we need a list of topics to which sub_keys were related - required by broker messages.
-            for item in pubsub_endpoint_queue_list_by_sub_keys(session, cluster_id, sub_key_list):
-                sub_keys = topic_sub_keys.setdefault(item.topic_name, [])
-                sub_keys.append(item.sub_key)
+            topic_sub_keys = get_topic_sub_keys_from_sub_keys(session, cluster_id, sub_key_list)
 
             # Remove the subscription object which in turn cascades and removes all dependant objects
             session.query(PubSubSubscription).\
                 filter(PubSubSubscription.cluster_id==self.request.input.cluster_id).\
                 filter(PubSubSubscription.sub_key.in_(sub_key_list)).\
                 delete(synchronize_session=False)
-            session.expire_all()
 
+            self.logger.info('Deleting subscriptions `%s`', topic_sub_keys)
+
+            session.expire_all()
             session.commit()
 
-        # Notify workers that this subscription needs to be deleted
+        # Notify workers about deleted subscription(s)
         self.broker_client.publish({
             'topic_sub_keys': topic_sub_keys,
             'action': PUBSUB.SUBSCRIPTION_DELETE.value,
@@ -415,26 +473,78 @@ class DeleteEndpointQueue(AdminService):
 
 # ################################################################################################################################
 
-class GetEndpointQueueMessages(AdminService):
-    _filter_by = PubSubMessage.data_prefix,
+class _GetMessagesBase(object):
+    def _get_sub_by_sub_input(self):
+        if self.request.input.get('sub_id'):
+            return self.pubsub.get_subscription_by_id(self.request.input.sub_id)
+        elif self.request.input.get('sub_key'):
+            return self.pubsub.get_subscription_by_sub_key(self.request.input.sub_key)
+        else:
+            raise Exception('Either sub_id or sub_key must be given on input')
 
-    class SimpleIO(GetListAdminSIO):
-        input_required = ('cluster_id', 'sub_id')
-        output_required = (AsIs('msg_id'), 'recv_time', 'data_prefix_short')
-        output_optional = (Int('delivery_count'), 'last_delivery_time', 'is_in_staging', 'has_gd', 'queue_name', 'endpoint_id')
-        output_repeated = True
+# ################################################################################################################################
+
+class GetEndpointQueueMessagesGD(AdminService, _GetMessagesBase):
+    """ Returns a list of GD messages queued up for input subscription.
+    """
+    _filter_by = PubSubMessage.data_prefix,
+    SimpleIO = _GetEndpointQueueMessagesSIO
 
     def get_data(self, session):
+        sub = self._get_sub_by_sub_input()
+
         return self._search(
-            pubsub_messages_for_queue, session, self.request.input.cluster_id, self.request.input.sub_id, False)
+            pubsub_messages_for_queue, session, self.request.input.cluster_id, sub.sub_key, True, False)
 
     def handle(self):
         with closing(self.odb.session()) as session:
             self.response.payload[:] = self.get_data(session)
 
         for item in self.response.payload.zato_output:
-            item.recv_time = datetime_from_ms(item.recv_time)
-            item.last_delivery_time = datetime_from_ms(item.last_delivery_time) if item.last_delivery_time else ''
+            item.recv_time = datetime_from_ms(item.recv_time * 1000.0)
+            item.published_by_name = self.pubsub.get_endpoint_by_id(item.published_by_id).name
+
+# ################################################################################################################################
+
+class GetServerEndpointQueueMessagesNonGD(AdminService):
+    """ Returns a list of non-GD messages for an input queue by its sub_key which must exist on current server,
+    i.e. current server must be the delivery server for this sub_key.
+    """
+    SimpleIO = _GetEndpointQueueMessagesSIO
+
+    def handle(self):
+        ps_tool = self.pubsub.get_pubsub_tool_by_sub_key(self.request.input.sub_key)
+        messages = ps_tool.get_messages(self.request.input.sub_key, False)
+
+        data_prefix_len = self.pubsub.data_prefix_len
+        data_prefix_short_len = self.pubsub.data_prefix_short_len
+
+        self.response.payload[:] = [
+            make_short_msg_copy_from_msg(elem, data_prefix_len, data_prefix_short_len) for elem in messages]
+
+        for elem in self.response.payload:
+            elem['recv_time'] = datetime_from_ms(elem['recv_time'] * 1000.0)
+            elem['published_by_name'] = self.pubsub.get_endpoint_by_id(elem['published_by_id']).name
+
+# ################################################################################################################################
+
+class GetEndpointQueueMessagesNonGD(NonGDSearchService, _GetMessagesBase):
+    """ Returns a list of non-GD messages for an input queue by its sub_key.
+    """
+    SimpleIO = _GetEndpointQueueMessagesSIO
+
+    def handle(self):
+        sub = self._get_sub_by_sub_input()
+        sk_server = self.pubsub.get_delivery_server_by_sub_key(sub.sub_key)
+
+        if sk_server:
+            response = self.servers[sk_server.server_name].invoke(GetServerEndpointQueueMessagesNonGD.get_name(), {
+                'cluster_id': self.request.input.cluster_id,
+                'sub_key': sub.sub_key,
+            }, pid=sk_server.server_pid)
+
+            if response:
+                self.response.payload[:] = reversed(response['response'])
 
 # ################################################################################################################################
 
@@ -443,6 +553,7 @@ class _GetEndpointSummaryBase(AdminService):
     """
     class SimpleIO:
         input_required = ('cluster_id',)
+        input_optional = ('topic_id',)
         output_required = ('id', 'endpoint_name', 'endpoint_type', 'subscription_count', 'is_active', 'is_internal')
         output_optional = ('security_id', 'sec_type', 'sec_name', 'ws_channel_id', 'ws_channel_name',
             'service_id', 'service_name', 'last_seen', 'last_deliv_time', 'role')
@@ -481,7 +592,9 @@ class GetEndpointSummaryList(_GetEndpointSummaryBase):
         response_elem = 'zato_pubsub_endpoint_get_endpoint_summary_list_response'
 
     def get_data(self, session):
-        result = self._search(pubsub_endpoint_summary_list, session, self.request.input.cluster_id, False)
+        result = self._search(pubsub_endpoint_summary_list, session, self.request.input.cluster_id,
+            self.request.input.topic_id, False)
+
         for item in result:
 
             if item.last_seen:
@@ -533,5 +646,44 @@ class GetTopicSubList(AdminService):
             })
 
         self.response.payload.topic_sub_list = out
+
+# ################################################################################################################################
+
+class GetServerDeliveryMessages(AdminService):
+    """ Returns a list of messages to be delivered to input endpoint. The messages must exist on current server.
+    """
+    class SimpleIO(AdminSIO):
+        input_required = ('sub_key',)
+        output_optional = ('msg_list',)
+
+    def handle(self):
+        ps_tool = self.pubsub.get_pubsub_tool_by_sub_key(self.request.input.sub_key)
+        self.response.payload.msg_list = ps_tool.pull_messages(self.request.input.sub_key)
+
+# ################################################################################################################################
+
+class GetDeliveryMessages(AdminService, _GetMessagesBase):
+    """ Returns a list of messages to be delivered to input endpoint.
+    """
+    class SimpleIO(AdminSIO):
+        input_required = ('cluster_id', 'sub_key')
+        output_optional = msg_pub_attrs_sio
+        output_repeated = True
+        skip_empty_keys = True
+        default_value = None
+
+    def handle(self):
+        sub = self._get_sub_by_sub_input()
+        sk_server = self.pubsub.get_delivery_server_by_sub_key(sub.sub_key)
+
+        if sk_server:
+            response = self.servers[sk_server.server_name].invoke(GetServerDeliveryMessages.get_name(), {
+                'sub_key': sub.sub_key,
+            }, pid=sk_server.server_pid)
+
+            if response:
+                self.response.payload[:] = reversed(response['response']['msg_list'])
+        else:
+            self.logger.info('Could not find delivery server for sub_key:`%s`', sub.sub_key)
 
 # ################################################################################################################################

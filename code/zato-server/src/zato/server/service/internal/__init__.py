@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 
 """
-Copyright (C) 2018, Zato Source s.r.o. https://zato.io
+Copyright (C) 2019, Zato Source s.r.o. https://zato.io
 
 Licensed under LGPLv3, see LICENSE.txt for terms and conditions.
 """
@@ -13,12 +13,17 @@ import logging
 from contextlib import closing
 from traceback import format_exc
 
+# Python 2/3 compatibility
+from past.builtins import basestring
+
 # Zato
 from zato.common import SECRET_SHADOW, zato_namespace, ZATO_NONE
 from zato.common.broker_message import MESSAGE_TYPE
+from zato.common.odb.model import Cluster
 from zato.common.util import get_response_value, replace_private_key
 from zato.common.util.sql import search as sql_search
-from zato.server.service import Int, Service
+from zato.server.service import Bool, Int, Service
+from zato.server.service.reqresp.sio import convert_sio
 
 # ################################################################################################################################
 
@@ -46,10 +51,18 @@ class SearchTool(object):
         return self.output_meta['search'].get('num_pages')
 
     def set_output_meta(self, result):
-        meta = self.output_meta['search']
+        self.output_meta['search'].update(result.to_dict())
 
-        for name in self._search_attrs:
-            meta[name] = getattr(result, name, None)
+# ################################################################################################################################
+
+class AdminSIO(object):
+    namespace = zato_namespace
+
+# ################################################################################################################################
+
+class GetListAdminSIO(object):
+    namespace = zato_namespace
+    input_optional = (Int('cur_page'), Bool('paginate'), 'query')
 
 # ################################################################################################################################
 
@@ -57,6 +70,10 @@ class AdminService(Service):
     """ A Zato admin service, part of the Zato public API.
     """
     output_optional = ('_meta',)
+
+    class SimpleIO(AdminSIO):
+        """ This empty definition is needed in case the service should be invoked through REST.
+        """
 
     def __init__(self):
         super(AdminService, self).__init__()
@@ -66,10 +83,14 @@ class AdminService(Service):
     def _init(self, is_http):
         if self._filter_by:
             self._search_tool = SearchTool(self._filter_by)
-
         self.ipc_api = self.server.ipc_api
-
         super(AdminService, self)._init(is_http)
+
+# ################################################################################################################################
+
+    def _convert_sio_elem(self, param_name, value):
+        return convert_sio(self.cid, param_name, param_name, value, True, False, self.request.bool_parameter_prefixes,
+            self.request.int_parameters, self.request.int_parameter_suffixes, False, self.server.encrypt, True)
 
 # ################################################################################################################################
 
@@ -83,30 +104,42 @@ class AdminService(Service):
                 if 'password' in k:
                     request[k] = SECRET_SHADOW
 
-            logger.info('cid:[%s], name:[%s], SIO request:[%s]', self.cid, self.name, request)
+            logger.info('cid:`%s`, name:`%s`, request:`%s`', self.cid, self.name, request)
 
 # ################################################################################################################################
 
     def handle(self, *args, **kwargs):
-        raise NotImplementedError('Should be overridden by subclasses')
+        raise NotImplementedError('Should be overridden by subclasses (AdminService.handle)')
+
+# ################################################################################################################################
+
+    def _new_zato_instance_with_cluster(self, instance_class, cluster_id=None, **kwargs):
+        with closing(self.odb.session()) as session:
+            cluster_id = cluster_id or self.request.input.cluster_id
+            cluster = session.query(Cluster).\
+                   filter(Cluster.id==cluster_id).\
+                   one()
+        return instance_class(cluster=cluster, **kwargs)
 
 # ################################################################################################################################
 
     def after_handle(self):
+
         payload = self.response.payload
-        is_basestring = isinstance(payload, basestring)
+        is_text = isinstance(payload, basestring)
         needs_meta = self.request.input.get('needs_meta', True)
 
-        if needs_meta and hasattr(self, '_search_tool') and not is_basestring:
-            payload.zato_meta = self._search_tool.output_meta
+        if needs_meta and hasattr(self, '_search_tool'):
+            if not is_text:
+                payload.zato_meta = self._search_tool.output_meta
 
         logger.info(
-            'cid:`%s`, name:`%s`, response:`%s`', self.cid, self.name, replace_private_key(get_response_value(self.response)))
+            'cid:`%s`, name:`%s`, response:`%r`', self.cid, self.name, replace_private_key(get_response_value(self.response)))
 
 # ################################################################################################################################
 
     def get_data(self, *args, **kwargs):
-        raise NotImplementedError('Should be overridden by subclasses')
+        raise NotImplementedError('Should be overridden by subclasses (AdminService.get_data)')
 
 # ################################################################################################################################
 
@@ -126,18 +159,9 @@ class AdminService(Service):
 
 # ################################################################################################################################
 
-class AdminSIO(object):
-    namespace = zato_namespace
-
-# ################################################################################################################################
-
-class GetListAdminSIO(object):
-    namespace = zato_namespace
-    input_optional = ('cur_page', 'paginate', 'query')
-
-# ################################################################################################################################
-
 class Ping(AdminService):
+    """ A ping service, useful for API testing.
+    """
     class SimpleIO(AdminSIO):
         output_required = ('pong',)
         response_elem = 'zato_ping_response'
@@ -157,6 +181,8 @@ class Ping(AdminService):
 # ################################################################################################################################
 
 class Ping2(Ping):
+    """ Works exactly the same as zato.ping, added to have another service for API testing.
+    """
     class SimpleIO(Ping.SimpleIO):
         response_elem = 'zato_ping2_response'
 
@@ -171,8 +197,7 @@ class ChangePasswordBase(AdminService):
     class SimpleIO(AdminSIO):
         input_required = (Int('id'), 'password1', 'password2')
 
-    def _handle(self, class_, auth_func, action, name_func=None, msg_type=MESSAGE_TYPE.TO_PARALLEL_ALL,
-                *args, **kwargs):
+    def _handle(self, class_, auth_func, action, name_func=None, msg_type=MESSAGE_TYPE.TO_PARALLEL_ALL, *args, **kwargs):
 
         with closing(self.odb.session()) as session:
             password1 = self.request.input.get('password1', '')
@@ -192,17 +217,17 @@ class ChangePasswordBase(AdminService):
                 if password1_decrypted != password2_decrypted:
                     raise Exception('Passwords need to be the same')
 
-                auth = session.query(class_).\
+                instance = session.query(class_).\
                     filter(class_.id==self.request.input.id).\
                     one()
 
-                auth_func(auth, password1)
+                auth_func(instance, password1)
 
-                session.add(auth)
+                session.add(instance)
                 session.commit()
 
                 if msg_type:
-                    name = name_func(auth) if name_func else auth.name
+                    name = name_func(instance) if name_func else instance.name
 
                     self.request.input.action = action
                     self.request.input.name = name
@@ -210,7 +235,7 @@ class ChangePasswordBase(AdminService):
                     self.request.input.salt = kwargs.get('salt')
 
                     for attr in kwargs.get('publish_instance_attrs', []):
-                        self.request.input[attr] = getattr(auth, attr, ZATO_NONE)
+                        self.request.input[attr] = getattr(instance, attr, ZATO_NONE)
 
                     self.broker_client.publish(self.request.input, msg_type=msg_type)
 

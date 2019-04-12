@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 
 """
-Copyright (C) 2013 Dariusz Suchojad <dsuch at zato.io>
+Copyright (C) 2019, Zato Source s.r.o. https://zato.io
 
 Licensed under LGPLv3, see LICENSE.txt for terms and conditions.
 """
@@ -9,6 +9,7 @@ Licensed under LGPLv3, see LICENSE.txt for terms and conditions.
 from __future__ import absolute_import, division, print_function, unicode_literals
 
 # stdlib
+import datetime
 import logging
 from copy import deepcopy
 from traceback import format_exc
@@ -23,15 +24,24 @@ from lxml.objectify import Element
 # Paste
 from paste.util.converters import asbool
 
+# Python 2/3 compatibility
+from builtins import bytes
+from past.builtins import cmp, unicode
+
 # Zato
 from zato.common import APISPEC, DATA_FORMAT, NO_DEFAULT_VALUE, PARAMS_PRIORITY, ParsingException, path, SECRETS, \
      ZatoException, ZATO_NONE, ZATO_SEC_USE_RBAC
 from zato.common.exception import BadRequest, Reportable
 from zato.common.pubsub import PubSubMessage
 
+# ################################################################################################################################
+
 logger = logging.getLogger(__name__)
 
+# ################################################################################################################################
+
 NOT_GIVEN = b'ZATO_NOT_GIVEN'
+_sio_list_like = (list, tuple)
 
 # ################################################################################################################################
 
@@ -51,8 +61,8 @@ class ForceType(object):
         self.name = name
         self.args = args
         self.kwargs = kwargs
-
         self.default = kwargs.get('default', NO_DEFAULT_VALUE)
+        self._list_like = kwargs.get('list_like') or _sio_list_like
 
         #
         # Key - bool/data_type,
@@ -64,10 +74,13 @@ class ForceType(object):
         self.serialize_dispatch = {
             (False, DATA_FORMAT.JSON): self.from_json,
             (False, DATA_FORMAT.DICT): self.from_json,
+            (False, DATA_FORMAT.DICT): self.from_json,
+            (False, ''): self.from_json,
             (False, DATA_FORMAT.XML): self.from_xml,
 
             (True, DATA_FORMAT.JSON): self.to_json,
             (True, DATA_FORMAT.DICT): self.to_json,
+            (True, ''): self.to_json,
             (True, DATA_FORMAT.XML): self.to_xml,
         }
 
@@ -198,7 +211,7 @@ class Integer(ForceType):
     """ Gets transformed into an int object.
     """
     def from_json(self, value, *ignored):
-        return int(value) if value else 0
+        return int(value) if value else value
 
     from_xml = to_json = to_xml = from_json
 
@@ -208,7 +221,7 @@ class List(ForceType):
     """ Transformed into a list of items in JSON or a list of <item> elems in XML.
     """
     def from_json(self, value, *ignored):
-        return value
+        return value if isinstance(value, self._list_like) else [value]
 
     to_json = from_json
 
@@ -309,6 +322,47 @@ class UTC(ForceType):
 
 # ################################################################################################################################
 
+class Date(ForceType):
+    """ Serializes an object to a date string if it is not a string already.
+    """
+    def __init__(self, name, format='%Y-%m-%d', *args, **kwargs):
+        super(Date, self).__init__(name, format=format, *args, **kwargs)
+
+    def from_json(self, value, *ignored):
+        if isinstance(value, datetime.date):
+            if value.year < 1900:
+                return value.isoformat()
+            else:
+                return value.strftime(self.kwargs['format'])
+        else:
+            return value
+
+    from_xml = to_json = to_xml = from_json
+
+# ################################################################################################################################
+
+class DateTime(ForceType):
+    """ Serializes an object to a datetime string if it is not a string already.
+    """
+    def __init__(self, name, format='iso', *args, **kwargs):
+        super(DateTime, self).__init__(name, format=format, *args, **kwargs)
+
+    def from_json(self, value, *ignored):
+        if isinstance(value, datetime.datetime):
+            if self.kwargs['format'] == 'iso':
+                return value.isoformat()
+            else:
+                if value.year < 1900:
+                    return value.isoformat()
+                else:
+                    return value.strftime(self.kwargs['format'])
+        else:
+            return value
+
+    from_xml = to_json = to_xml = from_json
+
+# ################################################################################################################################
+
 class ServiceInput(Bunch):
     """ A Bunch holding the input to the service.
     """
@@ -345,37 +399,69 @@ def is_secret(param_name, _secrets_params=SECRETS.PARAMS):
 
 # ################################################################################################################################
 
+def resolve_default_value(param, default_value):
+    if isinstance(param, ForceType):
+
+        # Use the per-element's default value ..
+        value = param.default
+
+        # .. but if it is missing ..
+        if value == NO_DEFAULT_VALUE:
+
+            # .. use the SimpleIO-level default value, but only if it is not missing either.
+            value = default_value if default_value != NO_DEFAULT_VALUE else ''
+
+    # Not a ForceType wrapper, default to an empty string in this case.
+    else:
+        value = ''
+
+    return value
+
+# ################################################################################################################################
+
+def _resolve_output_value(param, force_empty_keys):
+    return None if force_empty_keys else resolve_default_value(param, '')
+
+# ################################################################################################################################
+
 def convert_sio(cid, param, param_name, value, has_simple_io_config, is_xml, bool_parameter_prefixes, int_parameters,
     int_parameter_suffixes, force_empty_keys, encrypt_func, encrypt_secrets, date_time_format=None, data_format=ZATO_NONE,
-    from_sio_to_external=False, special_values=(ZATO_NONE, ZATO_SEC_USE_RBAC), _is_bool=is_bool, _is_int=is_int,
+    from_sio_to_external=False, special_values=(str(ZATO_NONE), str(ZATO_SEC_USE_RBAC)), _is_bool=is_bool, _is_int=is_int,
     _is_secret=is_secret):
     try:
+
         if _is_bool(param, param_name, bool_parameter_prefixes):
-            if value == '' and force_empty_keys:
-                value = None
+            if value == '':
+                value = _resolve_output_value(param, force_empty_keys)
             else:
                 value = asbool(value or None) # value can be an empty string and asbool chokes on that
+            return value
 
         if value is not None:
             if isinstance(param, ForceType):
-                value = param.convert(value, param_name, data_format, from_sio_to_external)
+                if value == '':
+                    value = _resolve_output_value(param, force_empty_keys)
+                else:
+                    value = param.convert(value, param_name, data_format, from_sio_to_external)
             else:
                 # Empty string sent in lieu of integers are equivalent to None,
-                # as though they were never sent - this is need for internal metaclasses
-                if value == '' and _is_int(param_name, int_parameters, int_parameter_suffixes):
-                    value = None
-
-                if value and (value not in special_values) and has_simple_io_config:
+                # as though they were never sent - this is needed for internal metaclasses
+                if value == b'':
                     if _is_int(param_name, int_parameters, int_parameter_suffixes):
-                        value = int(value)
-                    elif encrypt_secrets and _is_secret(param_name):
-                        # It will be None in SIO responses
-                        if encrypt_func:
-                            value = encrypt_func(value)
+                        value = None
+
+                if value:
+                    if (value not in special_values) and has_simple_io_config:
+                        if _is_int(param_name, int_parameters, int_parameter_suffixes):
+                            value = int(value)
+                        elif encrypt_secrets and _is_secret(param_name):
+                            # It will be None in SIO responses
+                            if encrypt_func:
+                                value = encrypt_func(value)
 
         return value
 
-    except Exception, e:
+    except Exception as e:
         if isinstance(e, Reportable):
             e.cid = cid
             raise
@@ -392,7 +478,12 @@ class SIOConverter(object):
     """ A class which knows how to convert values into the types defined in a service's SimpleIO config.
     """
     def convert(self, *params):
-        return convert_sio(*params)
+        value = convert_sio(*params)
+
+        if self.zato_bytes_to_str_encoding and isinstance(value, bytes):
+            value = value.decode(self.zato_bytes_to_str_encoding)
+
+        return value
 
 # ################################################################################################################################
 
@@ -406,9 +497,9 @@ convert_from_dict = convert_from_json
 def convert_from_xml(payload, param_name, cid, is_required, is_complex, default_value, path_prefix, use_text):
     try:
         elem = path('{}.{}'.format(path_prefix, param_name), is_required).get_from(payload)
-    except ParsingException, e:
-        msg = 'Caught an exception while parsing, payload:[<![CDATA[{}]]>], e:[{}]'.format(
-            etree.tostring(payload), format_exc(e))
+    except ParsingException:
+        msg = 'Caught an exception while parsing, payload:`<![CDATA[{}]]>`, e:`{}`'.format(
+            etree.tostring(payload), format_exc())
         raise ParsingException(cid, msg)
 
     if is_complex:
@@ -482,11 +573,13 @@ def convert_param(cid, payload, param, data_format, is_required, default_value, 
                     raise ParsingException(cid, msg)
             else:
                 # Not required and not provided on input either in msg or channel params
-                value = ''
+                # so we can use an empty string, but with ForceType elements in particular,
+                # we want to use their optional default value so as not to assume anything about input data.
+                value = resolve_default_value(param, default_value)
 
     else:
         if value is not None and not isinstance(param, COMPLEX_VALUE):
-            if isinstance(value, str):
+            if isinstance(value, bytes):
                 value = value.decode('utf-8')
             else:
                 value = unicode(value)
@@ -504,26 +597,48 @@ class SIO_TYPE_MAP:
 
 # ################################################################################################################################
 
-    class OPEN_API_V2:
+    class OPEN_API_V3:
 
-        name = APISPEC.OPEN_API_V2
-        STRING = ('string', None)
+        name = APISPEC.OPEN_API_V3
+        STRING = ('string', 'string')
         DEFAULT = STRING
         INTEGER = ('integer', 'int32')
-        BOOLEAN = ('boolean', None)
+        BOOLEAN = ('boolean', 'boolean')
 
         map = {
             AsIs: STRING,
             Boolean: BOOLEAN,
             CSV: STRING,
-            Dict: (None, None),
+            Dict: ('string', 'binary'),
             Float: ('number', 'float'),
             Integer: INTEGER,
-            List: (None, None),
-            ListOfDicts: (None, None),
-            Opaque: (None, None),
+            List: ('string', 'binary'),
+            ListOfDicts: ('string', 'binary'),
+            Opaque: ('string', 'binary'),
             Unicode: STRING,
             UTC: ('string', 'date-time'),
+        }
+
+    class SOAP_12:
+
+        name = APISPEC.SOAP_12
+        STRING = ('string', 'xsd:string')
+        DEFAULT = STRING
+        INTEGER = ('integer', 'xsd:integer')
+        BOOLEAN = ('boolean', 'xsd:boolean')
+
+        map = {
+            AsIs: STRING,
+            Boolean: BOOLEAN,
+            CSV: STRING,
+            Dict: ('dict', 'zato:dict'),
+            Float: ('number', 'float'),
+            Integer: INTEGER,
+            List: ('list', 'zato:list'),
+            ListOfDicts: ('list-of-dicts', 'zato:list-of-dicts'),
+            Opaque: ('opaque', 'anyType'),
+            Unicode: STRING,
+            UTC: ('string', 'xsd:dateTime'),
         }
 
 # ################################################################################################################################
@@ -554,6 +669,6 @@ class SIO_TYPE_MAP:
 
     class __metaclass__(type):
         def __iter__(self):
-            return iter((self.OPEN_API_V2, self.ZATO))
+            return iter((self.OPEN_API_V3, self.SOAP_12, self.ZATO))
 
 # ################################################################################################################################

@@ -34,8 +34,7 @@ class Migration(migrations.Migration):
                 ('timezone', models.CharField(default='UTC', max_length=100, null=True)),
                 ('date_format', models.CharField(default='dd-mm-yyyy', max_length=100, null=True)),
                 ('time_format', models.CharField(default='24', max_length=10, null=True)),
-                ('msg_browser_max_shown', models.IntegerField(default=1000, null=True)),
-                ('msg_browser_show_internal', models.BooleanField(default=False)),
+                ('opaque1', models.TextField(null=True)),
                 ('user', models.OneToOneField(on_delete=django.db.models.deletion.CASCADE, to=settings.AUTH_USER_MODEL)),
             ],
             options={

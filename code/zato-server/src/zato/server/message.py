@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 
 """
-Copyright (C) 2013 Dariusz Suchojad <dsuch at zato.io>
+Copyright (C) 2019, Zato Source s.r.o. https://zato.io
 
 Licensed under LGPLv3, see LICENSE.txt for terms and conditions.
 """
@@ -24,13 +24,16 @@ from bunch import Bunch
 from dpath import util as dpath_util
 
 # jsonpointer
-from jsonpointer import JsonPointer, PathNotFoundException
+from jsonpointer import JsonPointer
 
 # lxml
 from lxml import etree
 
 # Paste
 from paste.util.converters import asbool
+
+# Python 2/3 compatibility
+from past.builtins import long
 
 # Zato
 from zato.common import MSG_MAPPER, ZATO_NOT_GIVEN
@@ -269,7 +272,7 @@ class JSONPointerStore(BaseStore):
 
         try:
             return pointer.set(doc, value, in_place)
-        except PathNotFoundException:
+        except Exception:
             dpath_util.new(doc, '/' + '/'.join(pointer.parts), value)
             return doc
 
@@ -369,9 +372,9 @@ class Mapper(object):
         if force_func:
             try:
                 value = force_func(value)
-            except Exception, e:
+            except Exception:
                 logger.warn('Error in force_func:`%s` `%s` over `%s` in `%s` -> `%s` e:`%s`',
-                    force_func_name, force_func, value, orig_from, to, format_exc(e))
+                    force_func_name, force_func, value, orig_from, to, format_exc())
                 raise
 
         dpath_util.new(self.target, to, value)

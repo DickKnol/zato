@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 
 """
-Copyright (C) 2011 Dariusz Suchojad <dsuch at zato.io>
+Copyright (C) 2019, Zato Source s.r.o. https://zato.io
 
 Licensed under LGPLv3, see LICENSE.txt for terms and conditions.
 """
@@ -9,24 +9,31 @@ Licensed under LGPLv3, see LICENSE.txt for terms and conditions.
 from __future__ import absolute_import, division, print_function, unicode_literals
 
 # stdlib
+from base64 import b64decode, b64encode
 from contextlib import closing
-from httplib import BAD_REQUEST, NOT_FOUND
-from json import dumps, loads
+from http.client import BAD_REQUEST, NOT_FOUND
+from json import loads
 from mimetypes import guess_type
 from tempfile import NamedTemporaryFile
 from traceback import format_exc
-from urlparse import parse_qs
 from uuid import uuid4
 
 # validate
 from validate import is_boolean
 
+# Python 2/3 compatibility
+from builtins import bytes
+from future.moves.urllib.parse import parse_qs
+from past.builtins import basestring
+
 # Zato
 from zato.common import BROKER, KVDB, ZatoException
 from zato.common.broker_message import SERVICE
+from zato.common.exception import BadRequest
 from zato.common.odb.model import Cluster, ChannelAMQP, ChannelWMQ, ChannelZMQ, DeployedService, HTTPSOAP, Server, Service
 from zato.common.odb.query import service_list
 from zato.common.util import hot_deploy, payload_from_request
+from zato.common.util.json_ import dumps
 from zato.server.service import Boolean, Integer
 from zato.server.service.internal import AdminService, AdminSIO, GetListAdminSIO
 
@@ -45,6 +52,7 @@ class GetList(AdminService):
         request_elem = 'zato_service_get_list_request'
         response_elem = 'zato_service_get_list_response'
         input_required = ('cluster_id', 'query')
+        input_optional = (Integer('cur_page'), Boolean('paginate'))
         output_required = ('id', 'name', 'is_active', 'impl_name', 'is_internal', Boolean('may_be_deleted'), Integer('usage'),
             Integer('slow_threshold'))
         output_repeated = True
@@ -171,8 +179,8 @@ class Edit(AdminService):
                 internal_del = is_boolean(self.server.fs_server_config.misc.internal_services_may_be_deleted)
                 self.response.payload.may_be_deleted = internal_del if service.is_internal else True
 
-            except Exception, e:
-                msg = 'Could not update the service, e:[{e}]'.format(e=format_exc(e))
+            except Exception:
+                msg = 'Service could not be updated, e:`{}`'.format(format_exc())
                 self.logger.error(msg)
                 session.rollback()
 
@@ -181,7 +189,7 @@ class Edit(AdminService):
 # ################################################################################################################################
 
 class Delete(AdminService):
-    """ Deletes a service
+    """ Deletes a service.
     """
     class SimpleIO(AdminSIO):
         request_elem = 'zato_service_delete_request'
@@ -210,9 +218,9 @@ class Delete(AdminService):
                        'is_internal':service.is_internal}
                 self.broker_client.publish(msg)
 
-            except Exception, e:
+            except Exception:
                 session.rollback()
-                msg = 'Could not delete the service, e:[{e}]'.format(e=format_exc(e))
+                msg = 'Service could not be deleted, e:`{}`'.format(format_exc())
                 self.logger.error(msg)
 
                 raise
@@ -220,8 +228,7 @@ class Delete(AdminService):
 # ################################################################################################################################
 
 class GetChannelList(AdminService):
-    """ Returns a list of channels of a given type through which the service
-    is being exposed.
+    """ Returns a list of channels of a given type through which the service is exposed.
     """
     class SimpleIO(AdminSIO):
         request_elem = 'zato_service_get_channel_list_request'
@@ -255,7 +262,7 @@ class GetChannelList(AdminService):
 # ################################################################################################################################
 
 class Invoke(AdminService):
-    """ Invokes the service directly, as though it was exposed through some channel defined in web-admin.
+    """ Invokes the service directly, as though it was exposed through a channel defined in web-admin.
     """
     class SimpleIO(AdminSIO):
         request_elem = 'zato_service_invoke_request'
@@ -267,7 +274,8 @@ class Invoke(AdminService):
     def handle(self):
         payload = self.request.input.get('payload')
         if payload:
-            payload = payload_from_request(self.cid, payload.decode('base64'),
+            payload = b64decode(payload)
+            payload = payload_from_request(self.cid, payload,
                 self.request.input.data_format, self.request.input.transport)
 
         id = self.request.input.get('id')
@@ -311,13 +319,13 @@ class Invoke(AdminService):
 
         if isinstance(response, basestring):
             if response:
-                self.response.payload.response = response.encode('base64') if response else ''
+                response = response if isinstance(response, bytes) else response.encode('utf8')
+                self.response.payload.response = b64encode(response) if response else ''
 
 # ################################################################################################################################
 
 class GetDeploymentInfoList(AdminService):
-    """ Returns detailed information regarding the service's deployment status
-    on each of the servers it's been deployed to.
+    """ Returns detailed information regarding the service's deployment status on each of the servers it's been deployed to.
     """
     class SimpleIO(AdminSIO):
         request_elem = 'zato_service_get_deployment_info_list_request'
@@ -334,7 +342,7 @@ class GetDeploymentInfoList(AdminService):
             all()
 
         for item in items:
-            item.details = loads(loads(item.details))
+            item.details = loads(item.details)
 
         return items
 
@@ -370,7 +378,7 @@ class GetSourceInfo(AdminService):
             si = self.get_data(session)
             self.response.payload.service_id = si.service_id
             self.response.payload.server_name = si.server_name
-            self.response.payload.source = si.source.encode('base64') if si.source else None
+            self.response.payload.source = b64encode(si.source) if si.source else None
             self.response.payload.source_path = si.source_path
             self.response.payload.source_hash = si.source_hash
             self.response.payload.source_hash_method = si.source_hash_method
@@ -378,8 +386,7 @@ class GetSourceInfo(AdminService):
 # ################################################################################################################################
 
 class GetWSDL(AdminService):
-    """ Returns a WSDL for the given service. Either uses a user-uploaded one,
-    or, optionally generates one on fly if the service uses SimpleIO.
+    """ Returns a WSDL for the given service. Either uses a user-uploaded one, or, optionally generates one on fly if the service uses SimpleIO.
     """
     class SimpleIO(AdminSIO):
         request_elem = 'zato_service_get_wsdl_request'
@@ -388,10 +395,10 @@ class GetWSDL(AdminService):
         output_required = ('content_type',)
         output_optional = ('wsdl', 'wsdl_name',)
 
-    def handle(self):
+    def handle(self, _parse_qs=parse_qs):
         if self.wsgi_environ['QUERY_STRING']:
             use_sio = False
-            query = parse_qs(self.wsgi_environ['QUERY_STRING'])
+            query = _parse_qs(self.wsgi_environ['QUERY_STRING'])
             service_name = query.get('service', (None,))[0]
             cluster_id = query.get('cluster_id', (None,))[0]
         else:
@@ -424,7 +431,7 @@ class GetWSDL(AdminService):
             content_type = 'text/plain'
 
         if use_sio:
-            self.response.payload.wsdl = (service.wsdl or '').encode('base64')
+            self.response.payload.wsdl = b64encode(service.wsdl or '')
             self.response.payload.wsdl_name = service.wsdl_name
             self.response.payload.content_type = content_type
         else:
@@ -456,7 +463,7 @@ class SetWSDL(AdminService):
             service = session.query(Service).\
                 filter_by(name=self.request.input.name, cluster_id=self.request.input.cluster_id).\
                 one()
-            service.wsdl = self.request.input.wsdl.decode('base64')
+            service.wsdl = b64decode(self.request.input.wsdl)
             service.wsdl_name = self.request.input.wsdl_name
 
             session.add(service)
@@ -484,8 +491,7 @@ class HasWSDL(AdminService):
 # ################################################################################################################################
 
 class GetRequestResponse(AdminService):
-    """ Returns a sample request/response along with information on how often
-    the pairs should be stored in the DB.
+    """ Returns a sample request/response along with information on how often the pairs should be stored in the DB.
     """
     class SimpleIO(AdminSIO):
         request_elem = 'zato_service_get_request_response_request'
@@ -512,8 +518,8 @@ class GetRequestResponse(AdminService):
         self.response.payload.sample_cid = result.get('cid')
         self.response.payload.sample_req_ts = result.get('req_ts')
         self.response.payload.sample_resp_ts = result.get('resp_ts')
-        self.response.payload.sample_req = result.get('req', '').encode('base64')
-        self.response.payload.sample_resp = result.get('resp', '').encode('base64')
+        self.response.payload.sample_req = b64encode(result.get('req', b''))
+        self.response.payload.sample_resp = b64encode(result.get('resp', b''))
         self.response.payload.sample_req_resp_freq = result.get('freq', 0)
 
 # ################################################################################################################################
@@ -533,7 +539,7 @@ class ConfigureRequestResponse(AdminService):
 # ################################################################################################################################
 
 class UploadPackage(AdminService):
-    """ Returns a boolean flag indicating whether the server has a WSDL attached.
+    """ Uploads a package with service(s) to be hot-deployed.
     """
     class SimpleIO(AdminSIO):
         request_elem = 'zato_service_upload_package_request'
@@ -542,7 +548,8 @@ class UploadPackage(AdminService):
 
     def handle(self):
         with NamedTemporaryFile(prefix='zato-hd-', suffix=self.request.input.payload_name) as tf:
-            tf.write(self.request.input.payload.decode('base64'))
+            input_payload = b64decode(self.request.input.payload)
+            tf.write(input_payload)
             tf.flush()
 
             package_id = hot_deploy(self.server, self.request.input.payload_name, tf.name, False)
@@ -614,5 +621,45 @@ class GetSlowResponse(_SlowResponseService):
         data = self.get_data()
         if data:
             self.response.payload = data[0]
+
+# ################################################################################################################################
+
+class ServiceInvoker(AdminService):
+    """ A proxy service to invoke other services through via REST.
+    """
+    name = 'pub.zato.service.service-invoker'
+
+    def handle(self, _internal=('zato', 'pub.zato')):
+
+        # Service name is given in URL path
+        service_name = self.request.http.params.service_name
+
+        # Make sure the service exists
+        if self.server.service_store.has_service(service_name):
+
+            # Depending on HTTP verb used, we may need to look up input in different places
+            if self.request.http.method == 'GET':
+                payload = self.request.http.GET
+            else:
+                payload = self.request.raw_request
+                payload = loads(payload) if payload else None
+
+            # Invoke the service now
+            response = self.invoke(service_name, payload, wsgi_environ={'HTTP_METHOD':self.request.http.method})
+
+            # All internal services wrap their responses in top-level elements that we need to shed here.
+            if service_name.startswith(_internal):
+                if response:
+                    top_level = response.keys()[0]
+                    response = response[top_level]
+
+            # Assign response to outgoing payload
+            self.response.payload = dumps(response)
+            self.response.data_format = 'application/json'
+
+        # No such service as given on input
+        else:
+            self.response.data_format = 'text/plain'
+            raise BadRequest(self.cid, 'No such service `{}`'.format(service_name))
 
 # ################################################################################################################################

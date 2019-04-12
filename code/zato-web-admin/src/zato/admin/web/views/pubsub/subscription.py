@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 
 """
-Copyright (C) 2017, Zato Source s.r.o. https://zato.io
+Copyright (C) 2019, Zato Source s.r.o. https://zato.io
 
 Licensed under LGPLv3, see LICENSE.txt for terms and conditions.
 """
@@ -37,6 +37,7 @@ class Index(_Index):
 
     class SimpleIO(_Index.SimpleIO):
         input_required = ('cluster_id',)
+        input_optional = ('topic_id',)
         output_required = ('id', 'endpoint_name', 'endpoint_type', 'subscription_count', 'is_active', 'is_internal')
         output_optional = ('security_id', 'sec_type', 'sec_name', 'ws_channel_id', 'ws_channel_name',
             'service_id', 'service_name', 'last_seen', 'last_deliv_time', 'role')
@@ -57,29 +58,48 @@ class Index(_Index):
         data_list = Bunch()
         data_list.security_list = []
         data_list.service_list = []
-
         select_data_target = Bunch()
+        topic_name = None
+        create_form = None
+        edit_form = None
 
-        for endpoint_type in PUBSUB.ENDPOINT_TYPE:
+        for endpoint_type in PUBSUB.ENDPOINT_TYPE():
             select_data_target[endpoint_type.id] = []
 
         if self.req.zato.cluster_id:
 
             for item in self.items:
                 targets = select_data_target[item.endpoint_type]
-                targets.append({b'id':item.id, b'name':item.endpoint_name})
+                targets.append({b'id':item.id, b'name':item.endpoint_name.encode('utf8')})
 
             # Security definitions
             data_list.security_list = self.get_sec_def_list('basic_auth').def_items
 
             # Services
-            data_list.service_list = self.req.zato.client.invoke(
-                'zato.service.get-list', {'cluster_id': self.req.zato.cluster_id}).data
+            data_list.service_list = self.req.zato.client.invoke('zato.service.get-list', {
+                'cluster_id': self.req.zato.cluster_id
+            }).data
+
+            data_list.out_amqp_list = self.req.zato.client.invoke('zato.outgoing.amqp.get-list', {
+                'cluster_id': self.req.zato.cluster_id
+            }).data
+
+            # Topic
+            if self.input.topic_id:
+                topic_name = self.req.zato.client.invoke('zato.pubsub.topic.get', {
+                    'cluster_id': self.req.zato.cluster_id,
+                    'id': self.input.topic_id
+                }).data.response.name
+
+            create_form = CreateForm(self.req, data_list)
+            edit_form = EditForm(self.req, data_list, prefix='edit')
 
         return {
-            'create_form': CreateForm(self.req, data_list),
-            'edit_form': EditForm(self.req, data_list, prefix='edit'),
+            'create_form': create_form,
+            'edit_form': edit_form,
             'select_data_target': select_data_target,
+            'topic_name': topic_name,
+            'topic_id': self.input.topic_id,
         }
 
 # ################################################################################################################################
@@ -91,7 +111,7 @@ class _CreateEdit(CreateEdit):
         input_required = ('endpoint_id', 'is_active', 'cluster_id', 'server_id')
         input_optional = ('has_gd', 'topic_list_json', 'endpoint_type', 'endpoint_id', 'active_status',
             'delivery_method', 'delivery_data_format', 'delivery_batch_size', 'wrap_one_msg_in_list', 'delivery_max_retry',
-            'delivery_err_should_block', 'wait_sock_err', 'wait_non_sock_err', 'amqp_exchange',
+            'delivery_err_should_block', 'wait_sock_err', 'wait_non_sock_err', 'out_amqp_id', 'amqp_exchange',
             'amqp_routing_key', 'files_directory_list', 'ftp_directory_list', 'out_rest_http_soap_id', 'rest_delivery_endpoint',
             'service_id', 'sms_twilio_from', 'sms_twilio_to_list', 'smtp_is_html', 'smtp_subject', 'smtp_from', 'smtp_to_list',
             'smtp_body', 'out_soap_http_soap_id', 'soap_delivery_endpoint', 'out_http_method')

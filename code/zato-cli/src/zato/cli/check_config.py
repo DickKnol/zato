@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 
 """
-Copyright (C) 2018, Zato Source s.r.o. https://zato.io
+Copyright (C) 2019, Zato Source s.r.o. https://zato.io
 
 Licensed under LGPLv3, see LICENSE.txt for terms and conditions.
 """
@@ -23,11 +23,14 @@ from configobj import ConfigObj
 # psutil
 from psutil import AccessDenied, Process, NoSuchProcess
 
+# Python 2/3 compatibility
+from future.utils import iteritems
+
 # Zato
 from zato.cli import ManageCommand
 from zato.common import INFO_FORMAT, ping_queries
 from zato.common.component_info import get_info
-from zato.common.crypto import SchedulerCryptoManager, ServerCryptoManager, WebAdminCryptoManager
+from zato.common.crypto import resolve_secret_key, SchedulerCryptoManager, ServerCryptoManager, WebAdminCryptoManager
 from zato.common.kvdb import KVDB
 from zato.common.haproxy import validate_haproxy_config
 from zato.common.odb import create_pool, get_ping_query
@@ -72,7 +75,7 @@ class CheckConfig(ManageCommand):
 # ################################################################################################################################
 
     def check_sql_odb_server_scheduler(self, cm, conf, fs_sql_config, needs_decrypt_password=True):
-        engine_params = dict(conf['odb'].items())
+        engine_params = dict(iteritems((conf['odb'])))
         engine_params['extra'] = {}
         engine_params['pool_size'] = 1
 
@@ -108,7 +111,7 @@ class CheckConfig(ManageCommand):
 
     def on_server_check_kvdb(self, cm, conf, conf_key='kvdb'):
 
-        kvdb_config = Bunch(dict(conf[conf_key].items()))
+        kvdb_config = Bunch(dict(iteritems((conf[conf_key]))))
         kvdb = KVDB(None, kvdb_config, cm.decrypt)
         kvdb.init()
 
@@ -141,7 +144,8 @@ class CheckConfig(ManageCommand):
             # that we can safely delete.
             pid = open(pidfile).read().strip()
             try:
-                pid = int(pid)
+                if pid:
+                    pid = int(pid)
             except ValueError:
                 raise Exception('Could not parse pid value `{}` as an integer ({})'.format(pid, pidfile))
             else:
@@ -179,11 +183,12 @@ class CheckConfig(ManageCommand):
                     log_path = abspath(join(self.component_dir, 'logs', '{}.log'.format(log_file_marker)))
                     lock_path = abspath(join(self.component_dir, 'logs', '{}.lock'.format(log_file_marker)))
 
-                    for name in Process(pid).open_files():
-                        if name.path == log_path:
-                            has_log = True
-                        elif name.path == lock_path:
-                            has_lock = True
+                    if pid:
+                        for name in Process(pid).open_files():
+                            if name.path == log_path:
+                                has_log = True
+                            elif name.path == lock_path:
+                                has_lock = True
 
                     # Both files exist - this is our component and it's running so we cannot continue
                     if has_log and has_lock:
@@ -273,8 +278,11 @@ class CheckConfig(ManageCommand):
     def _on_web_admin(self, args, *ignored_args, **ignored_kwargs):
         repo_dir = join(self.component_dir, 'config', 'repo')
 
+        secret_key = getattr(args, 'secret_key', None)
+        secret_key = resolve_secret_key(secret_key)
+
         self.check_sql_odb_web_admin(
-            self.get_crypto_manager(getattr(args, 'secret_key', None), getattr(args, 'stdin_data', None), WebAdminCryptoManager),
+            self.get_crypto_manager(secret_key, getattr(args, 'stdin_data', None), WebAdminCryptoManager),
             self.get_json_conf('web-admin.conf', repo_dir))
 
         self.ensure_no_pidfile('web-admin')
@@ -283,12 +291,18 @@ class CheckConfig(ManageCommand):
 # ################################################################################################################################
 
     def _on_scheduler(self, args, *ignored_args, **ignored_kwargs):
+        repo_dir = join(self.component_dir, 'config', 'repo')
+        server_conf_path = join(repo_dir, 'scheduler.conf')
+
         cm = self.get_crypto_manager(getattr(args, 'secret_key', None), getattr(args, 'stdin_data', None), SchedulerCryptoManager)
-        conf = ConfigObj(join(self.component_dir, 'config', 'repo', 'scheduler.conf'), use_zato=False)
+
+        secrets_conf_path = ConfigObj(join(repo_dir, 'secrets.conf'), use_zato=False)
+        server_conf = ConfigObj(server_conf_path, zato_secrets_conf=secrets_conf_path, zato_crypto_manager=cm, use_zato=True)
+
         fs_sql_config = self.get_sql_ini('sql.conf')
 
-        self.check_sql_odb_server_scheduler(cm, conf, fs_sql_config)
-        self.on_server_check_kvdb(cm, conf, 'broker')
+        self.check_sql_odb_server_scheduler(cm, server_conf, fs_sql_config)
+        self.on_server_check_kvdb(cm, server_conf, 'broker')
 
         self.ensure_no_pidfile('scheduler')
 

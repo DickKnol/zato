@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 
 """
-Copyright (C) 2013 Dariusz Suchojad <dsuch at zato.io>
+Copyright (C) 2019, Zato Source s.r.o. https://zato.io
 
 Licensed under LGPLv3, see LICENSE.txt for terms and conditions.
 """
@@ -78,16 +78,15 @@ class Create(_CreateEdit):
                     filter(JSONPointer.name==input.name).first()
 
                 if existing_one:
-                    raise Exception('JSON Pointer [{0}] already exists on this cluster'.format(input.name))
+                    raise Exception('JSON Pointer `{}` already exists in this cluster'.format(input.name))
 
                 definition = JSONPointer(None, input.name, input.value, cluster.id)
 
                 session.add(definition)
                 session.commit()
 
-            except Exception, e:
-                msg = 'Could not create an JSON Pointer, e:[%s]'
-                self.logger.error(msg, format_exc(e))
+            except Exception:
+                self.logger.error('Could not create a JSON Pointer, e:`%s`', format_exc())
                 session.rollback()
 
                 raise
@@ -99,7 +98,7 @@ class Create(_CreateEdit):
             self.response.payload.name = definition.name
 
 class Edit(_CreateEdit):
-    """ Updates an JSON Pointer.
+    """ Updates a JSON Pointer.
     """
     class SimpleIO(AdminSIO):
         request_elem = 'zato_message_json_pointer_edit_request'
@@ -133,9 +132,8 @@ class Edit(_CreateEdit):
                 session.add(definition)
                 session.commit()
 
-            except Exception, e:
-                msg = 'Could not update the JSON Pointer, e:[%s]'
-                self.logger.error(msg, format_exc(e))
+            except Exception:
+                self.logger.error('Could not update the JSON Pointer, e:`%s`', format_exc())
                 session.rollback()
 
                 raise
@@ -149,7 +147,7 @@ class Edit(_CreateEdit):
                 self.response.payload.name = definition.name
 
 class Delete(AdminService):
-    """ Deletes an JSON Pointer.
+    """ Deletes a JSON Pointer.
     """
     class SimpleIO(AdminSIO):
         request_elem = 'zato_message_json_pointer_delete_request'
@@ -165,9 +163,8 @@ class Delete(AdminService):
 
                 session.delete(auth)
                 session.commit()
-            except Exception, e:
-                msg = 'Could not delete the JSON Pointer, e:[%s]'
-                self.logger.error(msg, format_exc(e))
+            except Exception:
+                self.logger.error('Could not delete the JSON Pointer, e:`%s`', format_exc())
                 session.rollback()
 
                 raise

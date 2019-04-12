@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 
 """
-Copyright (C) 2018, Zato Source s.r.o. https://zato.io
+Copyright (C) 2019, Zato Source s.r.o. https://zato.io
 
 Licensed under LGPLv3, see LICENSE.txt for terms and conditions.
 """
@@ -25,15 +25,17 @@ import threading
 import traceback
 import socket
 import sys
+import unicodedata
 from ast import literal_eval
+from base64 import b64decode
+from binascii import hexlify
 from contextlib import closing
-from cStringIO import StringIO
 from datetime import datetime, timedelta
 from glob import glob
 from hashlib import sha256
-from importlib import import_module
-from inspect import ismethod
-from itertools import ifilter, izip, izip_longest, tee
+from inspect import isfunction, ismethod
+from itertools import tee
+from io import StringIO
 from operator import itemgetter
 from os import getuid
 from os.path import abspath, isabs, join
@@ -46,7 +48,6 @@ from tempfile import NamedTemporaryFile
 from threading import current_thread
 from time import sleep
 from traceback import format_exc
-from urlparse import urlparse
 
 # alembic
 from alembic import op
@@ -77,9 +78,6 @@ from numpy.random import bytes as random_bytes, seed as numpy_seed
 # OpenSSL
 from OpenSSL import crypto
 
-# pip
-from pip.download import unpack_file_url
-
 # portalocker
 import portalocker
 
@@ -92,15 +90,9 @@ import pytz
 # requests
 import requests
 
-# Spring Python
-from springpython.context import ApplicationContext
-from springpython.remoting.http import CAValidatingHTTPSConnection
-from springpython.remoting.xmlrpc import SSLClientTransport
-
 # SQLAlchemy
 import sqlalchemy as sa
 from sqlalchemy import orm
-from sqlalchemy.exc import IntegrityError, ProgrammingError
 
 # Texttable
 from texttable import Texttable
@@ -108,14 +100,26 @@ from texttable import Texttable
 # validate
 from validate import is_boolean, is_integer, VdtTypeError
 
+# Python 2/3 compatibility
+from builtins import bytes
+from future.moves.itertools import zip_longest
+from future.utils import iteritems, raise_
+from past.builtins import basestring, cmp, reduce, unicode
+from six import PY3
+from six.moves.urllib.parse import urlparse
+from zato.common.py23_ import ifilter, izip
+from zato.common.py23_.spring_ import CAValidatingHTTPSConnection, SSLClientTransport
+
+if PY3:
+    from functools import cmp_to_key
+
 # Zato
-from zato.common import CHANNEL, CLI_ARG_SEP, curdir as common_curdir, DATA_FORMAT, engine_def, engine_def_sqlite, KVDB, MISC, \
-     SECRET_SHADOW, SIMPLE_IO, soap_body_path, soap_body_xpath, TLS, TRACE1, ZatoException, zato_no_op_marker, ZATO_NOT_GIVEN, \
-     ZMQ
+from zato.common import CHANNEL, CLI_ARG_SEP, DATA_FORMAT, engine_def, engine_def_sqlite, KVDB, MISC, \
+     SECRET_SHADOW, SECRETS, SIMPLE_IO, soap_body_path, soap_body_xpath, TLS, TRACE1, ZatoException, zato_no_op_marker, \
+     ZATO_NOT_GIVEN, ZMQ
 from zato.common.broker_message import SERVICE
 from zato.common.crypto import CryptoManager
-from zato.common.odb.model import HTTPBasicAuth, HTTPSOAP, IntervalBasedJob, Job, Server, Service
-from zato.common.odb.query import _service as _service
+from zato.common.odb.model import Cluster, HTTPBasicAuth, HTTPSOAP, IntervalBasedJob, Job, Server, Service
 
 # ################################################################################################################################
 
@@ -133,7 +137,16 @@ cid_base = len(cid_symbols)
 
 # ################################################################################################################################
 
+# This reseeds the current process only and each parallel server does it for each subprocess too.
 numpy_seed()
+
+# ################################################################################################################################
+
+# We can initialize it once per process here
+_hostname = socket.gethostname()
+_fqdn = socket.getfqdn()
+_current_host = '{}/{}'.format(_hostname, _fqdn)
+_current_user = getpwuid(getuid()).pw_name
 
 # ################################################################################################################################
 
@@ -144,9 +157,14 @@ TLS_KEY_TYPE = {
 
 # ################################################################################################################################
 
+def is_method(class_, func=isfunction if PY3 else ismethod):
+    return func(class_)
+
+# ################################################################################################################################
+
 # (c) 2005 Ian Bicking and contributors; written for Paste (http://pythonpaste.org)
 # Licensed under the MIT license: http://www.opensource.org/licenses/mit-license.php
-def asbool(obj):
+def as_bool(obj):
     if isinstance(obj, (str, unicode)):
         obj = obj.strip().lower()
         if obj in ['true', 'yes', 'on', 'y', 't', '1']:
@@ -158,7 +176,7 @@ def asbool(obj):
                 "String is not true/false: %r" % obj)
     return bool(obj)
 
-def aslist(obj, sep=None, strip=True):
+def as_list(obj, sep=None, strip=True):
     if isinstance(obj, (str, unicode)):
         lst = obj.split(sep)
         if strip:
@@ -170,6 +188,9 @@ def aslist(obj, sep=None, strip=True):
         return []
     else:
         return [obj]
+
+asbool = as_bool
+aslist = as_list
 
 # ################################################################################################################################
 
@@ -185,7 +206,7 @@ def absjoin(base, path):
 # ################################################################################################################################
 
 def absolutize(path, base=''):
-    """ Turns a relative path to an absolute one or returns it as is if it's already absolute.
+    """ Turns a relative path into an absolute one or returns it as is if it's already absolute.
     """
     if not isabs(path):
         path = os.path.expanduser(path)
@@ -198,7 +219,7 @@ def absolutize(path, base=''):
 # ################################################################################################################################
 
 def current_host():
-    return socket.gethostname() + '/' + socket.getfqdn()
+    return _current_host
 
 # ################################################################################################################################
 
@@ -295,8 +316,7 @@ def make_repr(_object, ignore_double_underscore=True, to_avoid_list='repr_to_avo
     for attr in attrs:
         attr_obj = getattr(_object, attr)
         if not callable(attr_obj):
-            buff.write(' ')
-            buff.write('\n%s:`%r`' % (attr, attr_obj))
+            buff.write('; %s:%r' % (attr, attr_obj))
 
     out = _repr_template.safe_substitute(
         class_name=_object.__class__.__name__, mem_loc=hex(id(_object)), attrs=buff.getvalue())
@@ -325,10 +345,8 @@ def get_lb_client(lb_host, lb_agent_port, ssl_ca_certs, ssl_key_file, ssl_cert_f
     """
     from zato.agent.load_balancer.client import LoadBalancerAgentClient
 
-    agent_uri = "https://{host}:{port}/RPC2".format(host=lb_host, port=lb_agent_port)
+    agent_uri = 'https://{host}:{port}/RPC2'.format(host=lb_host, port=lb_agent_port)
 
-    # See the 'Problems with XML-RPC over SSL' thread for details
-    # https://lists.springsource.com/archives/springpython-users/2011-June/000480.html
     if sys.version_info >= (2, 7):
         class Python27CompatTransport(SSLClientTransport):
             def make_connection(self, host):
@@ -350,14 +368,14 @@ def tech_account_password(password_clear, salt):
 
 # ################################################################################################################################
 
-def new_cid(random_bytes=random_bytes):
+def new_cid(bytes=12, _random_bytes=random_bytes, _hexlify=hexlify):
     """ Returns a new 96-bit correlation identifier. It's *not* safe to use the ID
     for any cryptographical purposes, it's only meant to be used as a conveniently
     formatted ticket attached to each of the requests processed by Zato servers.
     Changed in 2.0: The number is now 28 characters long not 40, like in previous versions.
     Changed in 3.0: The number is now 96 bits rather than 128, 24 characters, with no constant prefix.
     """
-    return random_bytes(12).encode('hex')
+    return _hexlify(_random_bytes(bytes)).decode('utf8')
 
 # ################################################################################################################################
 
@@ -405,20 +423,8 @@ def _get_ioc_config(location, config_class):
 
 # ################################################################################################################################
 
-def get_app_context(config):
-    """ Returns the Zato's Inversion of Control application context.
-    """
-    ctx_class_path = config['spring']['context_class']
-    ctx_class_path = ctx_class_path.split('.')
-    mod_name, class_name = '.'.join(ctx_class_path[:-1]), ctx_class_path[-1:][0]
-    mod = import_module(mod_name)
-    class_ = getattr(mod, class_name)()
-    return ApplicationContext(class_)
-
-# ################################################################################################################################
-
 def get_current_user():
-    return getpwuid(getuid()).pw_name
+    return _current_user
 
 # ################################################################################################################################
 
@@ -439,7 +445,7 @@ def deployment_info(method, object_, timestamp, fs_location, remote_host='', rem
         'object': object_,
         'timestamp': timestamp,
         'fs_location':fs_location,
-        'remote_host': remote_host,
+        'remote_host': remote_host or os.environ.get('SSH_CONNECTION', ''),
         'remote_user': remote_user,
         'current_host': current_host(),
         'current_user': get_current_user(),
@@ -478,6 +484,8 @@ def payload_from_request(cid, request, data_format, transport):
             else:
                 if isinstance(request, objectify.ObjectifiedElement):
                     payload = request
+                elif len(request) == 0:
+                    payload = objectify.fromstring('<empty/>')
                 else:
                     payload = objectify.fromstring(request)
         elif data_format in(DATA_FORMAT.DICT, DATA_FORMAT.JSON):
@@ -485,6 +493,7 @@ def payload_from_request(cid, request, data_format, transport):
                 return ''
             if isinstance(request, basestring) and data_format == DATA_FORMAT.JSON:
                 try:
+                    request = request.decode('utf8') if isinstance(request, bytes) else request
                     payload = loads(request)
                 except ValueError:
                     logger.warn('Could not parse request as JSON:`{}`, e:`{}`'.format(request, format_exc()))
@@ -497,6 +506,29 @@ def payload_from_request(cid, request, data_format, transport):
         payload = request
 
     return payload
+
+# ################################################################################################################################
+
+BZ2_EXTENSIONS = ('.tar.bz2', '.tbz')
+XZ_EXTENSIONS = ('.tar.xz', '.txz', '.tlz', '.tar.lz', '.tar.lzma')
+ZIP_EXTENSIONS = ('.zip', '.whl')
+TAR_EXTENSIONS = ('.tar.gz', '.tgz', '.tar')
+ARCHIVE_EXTENSIONS = (ZIP_EXTENSIONS + BZ2_EXTENSIONS + TAR_EXTENSIONS + XZ_EXTENSIONS)
+
+def splitext(path):
+    """Like os.path.splitext, but take off .tar too"""
+    base, ext = os.path.splitext(path)
+    if base.lower().endswith('.tar'):
+        ext = base[-4:] + ext
+        base = base[:-4]
+    return base, ext
+
+def is_archive_file(name):
+    """Return True if `name` is a considered as an archive file."""
+    ext = splitext(name)[1].lower()
+    if ext in ARCHIVE_EXTENSIONS:
+        return True
+    return False
 
 # ################################################################################################################################
 
@@ -528,13 +560,6 @@ class _DummyLink(object):
     """
     def __init__(self, url):
         self.url = url
-
-# ################################################################################################################################
-
-def decompress(archive, dir_name):
-    """ Decompresses an archive into a directory, the directory must already exist.
-    """
-    unpack_file_url(_DummyLink('file:' + archive), dir_name)
 
 # ################################################################################################################################
 
@@ -614,7 +639,11 @@ def multikeysort(items, columns):
                 return mult * result
         else:
             return 0
-    return sorted(items, cmp=comparer)
+
+    if PY3:
+        return sorted(items, key=cmp_to_key(comparer))
+    else:
+        return sorted(items, cmp=comparer)
 
 # ################################################################################################################################
 
@@ -622,7 +651,7 @@ def multikeysort(items, columns):
 def grouper(n, iterable, fillvalue=None):
     "grouper(3, 'ABCDEFG', 'x') --> ABC DEF Gxx"
     args = [iter(iterable)] * n
-    return izip_longest(fillvalue=fillvalue, *args)
+    return zip_longest(fillvalue=fillvalue, *args)
 
 # ################################################################################################################################
 
@@ -750,32 +779,50 @@ def dotted_getattr(o, path):
 
 # ################################################################################################################################
 
-def get_service_by_name(session, cluster_id, name):
-    logger.debug('Looking for name:`%s` in cluster_id:`%s`'.format(name, cluster_id))
-    return _service(session, cluster_id).\
-           filter(Service.name==name).\
-           one()
-
-# ################################################################################################################################
-
 def add_startup_jobs(cluster_id, odb, jobs, stats_enabled):
     """ Adds internal jobs to the ODB. Note that it isn't being added
     directly to the scheduler because we want users to be able to fine-tune the job's
     settings.
     """
     with closing(odb.session()) as session:
+        now = datetime.utcnow()
         for item in jobs:
 
             if not stats_enabled and item['name'].startswith('zato.stats'):
                 continue
 
             try:
-                service_id = get_service_by_name(session, cluster_id, item['service'])[0]
+                extra = item.get('extra', '')
+                if isinstance(extra, basestring):
+                    extra = extra.encode('utf-8')
+                else:
+                    if item.get('is_extra_list'):
+                        extra = '\n'.join(extra)
+                    else:
+                        extra = dumps(extra)
 
-                now = datetime.utcnow()
+                if extra:
+                    if not isinstance(extra, bytes):
+                        extra = extra.encode('utf8')
 
-                job = Job(None, item['name'], True, 'interval_based', now, item.get('extra', '').encode('utf-8'),
-                          cluster_id=cluster_id, service_id=service_id)
+                service = session.query(Service).\
+                    filter(Service.name==item['service']).\
+                    filter(Cluster.id==cluster_id).\
+                    one()
+
+                cluster = session.query(Cluster).\
+                    filter(Cluster.id==cluster_id).\
+                    one()
+
+                existing_one = session.query(Job).\
+                    filter(Job.name==item['name']).\
+                    filter(Job.cluster_id==cluster_id).\
+                    first()
+
+                if existing_one:
+                    continue
+
+                job = Job(None, item['name'], True, 'interval_based', now, cluster=cluster, service=service, extra=extra)
 
                 kwargs = {}
                 for name in('seconds', 'minutes'):
@@ -787,9 +834,12 @@ def add_startup_jobs(cluster_id, odb, jobs, stats_enabled):
                 session.add(job)
                 session.add(ib_job)
                 session.commit()
-            except(IntegrityError, ProgrammingError), e:
-                session.rollback()
-                logger.debug('Caught an expected error, carrying on anyway, e:`%s`', format_exc(e).decode('utf-8'))
+
+            except Exception:
+                logger.warn(format_exc())
+
+            else:
+                logger.info('Initial job added `%s`', job.name)
 
 # ################################################################################################################################
 
@@ -881,7 +931,7 @@ def get_threads_traceback(pid):
     result = {}
     id_name = dict([(th.ident, th.name) for th in threading.enumerate()])
 
-    for thread_id, frame in sys._current_frames().items():
+    for thread_id, frame in iteritems(sys._current_frames()):
         key = '{}:{}'.format(pid, id_name.get(thread_id, '(No name)'))
         result[key] = get_stack(frame, True)
 
@@ -913,8 +963,8 @@ def dump_stacks(*ignored):
 
     rows = [['Proc:Thread/Greenlet', 'Traceback']]
 
-    rows.extend(sorted(get_threads_traceback(pid).items()))
-    rows.extend(sorted(get_greenlets_traceback(pid).items()))
+    rows.extend(sorted(iteritems(get_threads_traceback(pid))))
+    rows.extend(sorted(iteritems(get_greenlets_traceback(pid))))
 
     table.add_rows(rows)
     logger.info('\n' + table.draw())
@@ -927,13 +977,15 @@ def get_full_stack():
     stack = traceback.extract_stack()[:-1]  # last one would be full_stack()
     if exc is not None:  # i.e. if an exception is present
         del stack[-1]    # remove call of full_stack, the printed exception will contain the caught exception caller instead
-    trc = 'Traceback (most recent call last):\n'
-    stackstr = trc + ''.join(traceback.format_list(stack))
+    trace = 'Traceback (most recent call last):\n'
+    stack_string = trace + ''.join(traceback.format_list(stack))
 
     if exc is not None:
-        stackstr += '  ' + traceback.format_exc().decode('utf-8').lstrip(trc)
+        stack_string += '  '
+        stack_string += traceback.format_exc()
+        stack_string = stack_string.lstrip(trace)
 
-    return stackstr
+    return stack_string
 
 # ################################################################################################################################
 
@@ -941,6 +993,31 @@ def register_diag_handlers():
     """ Registers diagnostic handlers dumping stacks, threads and greenlets on receiving a signal.
     """
     signal.signal(signal.SIGURG, dump_stacks)
+
+# ################################################################################################################################
+
+def parse_simple_type(value, convert_bool=True):
+    if convert_bool:
+        try:
+            value = is_boolean(value)
+        except VdtTypeError:
+            # It's cool, not a boolean
+            pass
+
+    try:
+        value = is_integer(value)
+    except VdtTypeError:
+        # OK, not an integer
+        pass
+
+    # Could be a dict or another simple type then
+    try:
+        value = literal_eval(value)
+    except Exception:
+        pass
+
+    # Either parsed out or as it was received
+    return value
 
 # ################################################################################################################################
 
@@ -961,25 +1038,7 @@ def parse_extra_into_dict(lines, convert_bool=True):
 
                 key, value = line
                 value = value.strip()
-
-                if convert_bool:
-                    try:
-                        value = is_boolean(value)
-                    except VdtTypeError:
-                        # It's cool, not a boolean
-                        pass
-
-                try:
-                    value = is_integer(value)
-                except VdtTypeError:
-                    # OK, not an integer
-                    pass
-
-                # Could be a dict or another simple type then
-                try:
-                    value = literal_eval(value)
-                except Exception:
-                    pass
+                value = parse_simple_type(value, convert_bool)
 
                 # OK, let's just treat it as string
                 _extra[key.strip()] = value
@@ -1108,7 +1167,7 @@ def validate_tls_from_payload(payload, is_key=False):
         pem = open(tf.name).read()
 
         cert_info = crypto.load_certificate(crypto.FILETYPE_PEM, pem)
-        cert_info = sorted(dict(cert_info.get_subject().get_components()).items())
+        cert_info = sorted(dict(iteritems(cert_info.get_subject().get_components())))
         cert_info = '; '.join('{}={}'.format(k, v) for k, v in cert_info)
 
         if is_key:
@@ -1180,7 +1239,7 @@ def replace_private_key(orig_payload):
 def delete_tls_material_from_fs(server, info, full_path_func):
     try:
         os.remove(full_path_func(server.tls_dir, info))
-    except OSError, e:
+    except OSError as e:
         if e.errno == errno.ENOENT:
             # It's ok - some other worker must have deleted it already
             pass
@@ -1198,7 +1257,12 @@ def ping_solr(config):
 def ping_odoo(conn):
     user_model = conn.get_model('res.users')
     ids = user_model.search([('login', '=', conn.login)])
-    user_model.read(ids[0], ['login'])['login']
+    user_model.read(ids, ['login'])[0]['login']
+
+# ################################################################################################################################
+
+def ping_sap(conn):
+    conn.ping()
 
 # ################################################################################################################################
 
@@ -1258,7 +1322,7 @@ def get_basic_auth_credentials(auth):
         return None, None
 
     _, auth = auth.split(prefix)
-    auth = auth.strip().decode('base64')
+    auth = b64decode(auth.strip())
 
     return auth.split(':', 1)
 
@@ -1326,7 +1390,7 @@ def get_crypto_manager_from_server_config(config, repo_dir):
 
 # ################################################################################################################################
 
-def get_odb_session_from_server_config(config, cm):
+def get_odb_session_from_server_config(config, cm, odb_password_encrypted):
 
     engine_args = Bunch()
     engine_args.odb_type = config.odb.engine
@@ -1335,7 +1399,7 @@ def get_odb_session_from_server_config(config, cm):
     engine_args.odb_port = config.odb.port
     engine_args.odb_db_name = config.odb.db_name
 
-    if cm:
+    if odb_password_encrypted:
         engine_args.odb_password = cm.decrypt(config.odb.password) if config.odb.password else ''
     else:
         engine_args.odb_password = config.odb.password
@@ -1344,10 +1408,10 @@ def get_odb_session_from_server_config(config, cm):
 
 # ################################################################################################################################
 
-def get_server_client_auth(config, repo_dir):
+def get_server_client_auth(config, repo_dir, cm, odb_password_encrypted):
     """ Returns credentials to authenticate with against Zato's own /zato/admin/invoke channel.
     """
-    session = get_odb_session_from_server_config(config, get_crypto_manager_from_server_config(config, repo_dir))
+    session = get_odb_session_from_server_config(config, cm, odb_password_encrypted)
 
     with closing(session) as session:
         cluster = session.query(Server).\
@@ -1366,7 +1430,8 @@ def get_server_client_auth(config, repo_dir):
                 first()
 
             if security:
-                return (security.username, security.password)
+                password = security.password.replace(SECRETS.PREFIX, '')
+                return (security.username, cm.decrypt(password))
 
 def get_client_from_server_conf(server_dir):
     from zato.client import get_client_from_server_conf as client_get_client_from_server_conf
@@ -1459,9 +1524,9 @@ def startup_service_payload_from_path(name, value, repo_location):
 
     try:
         payload = open(path).read()
-    except Exception, e:
+    except Exception:
         logger.warn(
-            'Could not open payload path:`%s` `%s`, skipping startup service:`%s`, e:`%s`', orig_path, path, name, format_exc(e))
+            'Could not open payload path:`%s` `%s`, skipping startup service:`%s`, e:`%s`', orig_path, path, name, format_exc())
     else:
         return payload
 
@@ -1474,7 +1539,7 @@ def invoke_startup_services(source, key, fs_server_config, repo_location, broker
     also possible that other workers are already running. In short, there is no guarantee that any server or worker in particular
     will receive the requests, only that there will be exactly one.
     """
-    for name, payload in fs_server_config.get(key, {}).items():
+    for name, payload in iteritems(fs_server_config.get(key, {})):
 
         # Don't invoke SSO services if the feature is not enabled
         if not is_sso_enabled:
@@ -1546,13 +1611,14 @@ def spawn_greenlet(callable, *args, **kwargs):
     because if it does, it means that there were some errors.
     """
     try:
+        timeout = kwargs.pop('timeout', 0.2)
         g = spawn(callable, *args, **kwargs)
         gevent_sleep(0)
-        g.join(kwargs.pop('timeout', 0.2))
+        g.join(timeout)
 
         if g.exception:
             type_, value, traceback = g.exc_info
-            raise type_(value), None, traceback
+            raise_(type_(value), None, traceback)
 
     except Timeout:
         pass # Timeout = good = no errors
@@ -1609,27 +1675,7 @@ def require_tcp_port(address):
 
 # ################################################################################################################################
 
-def get_brython_js():
-    code_root = os.path.normpath(os.path.join(common_curdir, '..', '..', '..', '..'))
-    brython_path = os.path.join(
-        code_root, 'zato-web-admin', 'src', 'zato', 'admin', 'static', 'brython', '_brython', 'brython.js')
-
-    f = open(brython_path)
-    brython = f.read()
-    f.close()
-
-    # To make it 100% certain that we are returning the correct file
-    expected = '450c1a7fcab574947c5a5299b81512be2f251649c326209e7c612ed1be6f35e5'
-    actual = sha256(brython).hexdigest()
-
-    if actual != expected:
-        raise ValueError('Failed to validate hash of `{}`'.format(brython_path))
-
-    return brython
-
-# ################################################################################################################################
-
-def update_apikey_username(config):
+def update_apikey_username_to_channel(config):
     config.username = 'HTTP_{}'.format(config.get('username', '').upper().replace('-', '_'))
 
 # ################################################################################################################################
@@ -1672,7 +1718,7 @@ def is_class_pubsub_hook(class_):
 def ensure_pubsub_hook_is_valid(self, input, instance, attrs):
     """ An instance hook that validates if an optional pub/sub hook given on input actually subclasses PubSubHook.
     """
-    if input.hook_service_id:
+    if input.get('hook_service_id'):
         impl_name = self.server.service_store.id_to_impl_name[input.hook_service_id]
         details = self.server.service_store.services[impl_name]
         if not is_class_pubsub_hook(details['service_class']):
@@ -1685,10 +1731,10 @@ def is_func_overridden(func):
     whether users implemented a given hook. If there is a special internal marker in input arguments,
     it means that it is an internal function from parent class, not a user-defined one.
     """
-    if func and ismethod(func):
-        func_defaults = func.im_func.func_defaults
+    if func and is_method(func):
+        func_defaults = func.__defaults__ if PY3 else func.im_func.func_defaults
 
-        # Only internally defined methods will fullfil these conditions that they have default arguments
+        # Only internally defined methods will fulfill conditions that they have default arguments
         # and one of them is our no-op marker, hence if we negate it and the result is True,
         # it means it must have been a user-defined method.
         if not (func_defaults and isinstance(func_defaults, tuple) and zato_no_op_marker in func_defaults):
@@ -1708,5 +1754,56 @@ def get_sql_engine_display_name(engine, fs_sql_config):
             engine, fs_sql_config))
     else:
         return display_name
+
+# ################################################################################################################################
+
+def pretty_format_float(value):
+    return ('%f' % value).rstrip('0').rstrip('.') if value else value
+
+# ################################################################################################################################
+# The slugify function below is taken from Django:
+
+"""
+Copyright (c) Django Software Foundation and individual contributors.
+All rights reserved.
+
+Redistribution and use in source and binary forms, with or without modification,
+are permitted provided that the following conditions are met:
+
+    1. Redistributions of source code must retain the above copyright notice,
+       this list of conditions and the following disclaimer.
+
+    2. Redistributions in binary form must reproduce the above copyright
+       notice, this list of conditions and the following disclaimer in the
+       documentation and/or other materials provided with the distribution.
+
+    3. Neither the name of Django nor the names of its contributors may be used
+       to endorse or promote products derived from this software without
+       specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR
+ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+(INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON
+ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+"""
+
+def slugify(value, allow_unicode=False):
+    """ Convert to ASCII if 'allow_unicode' is False. Convert spaces to underscores.
+    Remove characters that aren't alphanumerics, underscores, or hyphens.
+    Convert to lowercase. Also strip leading and trailing whitespace.
+    """
+    if allow_unicode:
+        value = unicodedata.normalize('NFKC', value)
+        value = re.sub('[^\w\s-]', '', value, flags=re.U).strip().lower()
+        return re.sub('[-\s]+', '_', value, flags=re.U)
+    value = unicodedata.normalize('NFKD', value).encode('ascii', 'ignore').decode('ascii')
+    value = re.sub('[^\w\s-]', '', value).strip().lower()
+    return re.sub('[-\s]+', '_', value)
 
 # ################################################################################################################################

@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 
 """
-Copyright (C) 2011 Dariusz Suchojad <dsuch at zato.io>
+Copyright (C) 2019, Zato Source s.r.o. https://zato.io
 
 Licensed under LGPLv3, see LICENSE.txt for terms and conditions.
 """
@@ -31,7 +31,7 @@ class GetList(AdminService):
         response_elem = 'zato_channel_amqp_get_list_response'
         input_required = ('cluster_id',)
         output_required = ('id', 'name', 'is_active', 'queue', 'consumer_tag_prefix', 'def_name', 'def_id', 'service_name',
-            'pool_size', 'ack_mode')
+            'pool_size', 'ack_mode','prefetch_count')
         output_optional = ('data_format',)
 
     def get_data(self, session):
@@ -52,7 +52,7 @@ class Create(AdminService):
         request_elem = 'zato_channel_amqp_create_request'
         response_elem = 'zato_channel_amqp_create_response'
         input_required = ('cluster_id', 'name', 'is_active', 'def_id', 'queue', 'consumer_tag_prefix', 'service', 'pool_size',
-            'ack_mode')
+            'ack_mode','prefetch_count')
         input_optional = ('data_format',)
         output_required = ('id', 'name')
 
@@ -92,6 +92,7 @@ class Create(AdminService):
                 item.service = service
                 item.pool_size = input.pool_size
                 item.ack_mode = input.ack_mode
+                item.prefetch_count = input.prefetch_count
                 item.data_format = input.data_format
 
                 session.add(item)
@@ -99,14 +100,15 @@ class Create(AdminService):
 
                 input.action = CHANNEL.AMQP_CREATE.value
                 input.def_name = item.def_.name
+                input.id = item.id
                 input.service_name = service.name
                 self.broker_client.publish(input)
 
                 self.response.payload.id = item.id
                 self.response.payload.name = item.name
 
-            except Exception, e:
-                self.logger.error('Could not create an AMQP channel, e:`%s`', format_exc(e))
+            except Exception:
+                self.logger.error('Could not create an AMQP channel, e:`%s`', format_exc())
                 session.rollback()
 
                 raise
@@ -122,7 +124,7 @@ class Edit(AdminService):
         request_elem = 'zato_channel_amqp_edit_request'
         response_elem = 'zato_channel_amqp_edit_response'
         input_required = ('id', 'cluster_id', 'name', 'is_active', 'def_id', 'queue', 'consumer_tag_prefix', 'service',
-            'pool_size', 'ack_mode')
+            'pool_size', 'ack_mode','prefetch_count')
         input_optional = ('data_format',)
         output_required = ('id', 'name')
 
@@ -164,6 +166,7 @@ class Edit(AdminService):
                 item.service = service
                 item.pool_size = input.pool_size
                 item.ack_mode = input.ack_mode
+                item.prefetch_count = input.prefetch_count
                 item.data_format = input.data_format
 
                 session.add(item)
@@ -171,6 +174,7 @@ class Edit(AdminService):
 
                 input.action = CHANNEL.AMQP_EDIT.value
                 input.def_name = item.def_.name
+                input.id = item.id
                 input.old_name = old_name
                 input.service_name = service.name
                 self.broker_client.publish(input)
@@ -178,8 +182,8 @@ class Edit(AdminService):
                 self.response.payload.id = item.id
                 self.response.payload.name = item.name
 
-            except Exception, e:
-                self.logger.error('Could not update the AMQP definition, e:`%s`', format_exc(e))
+            except Exception:
+                self.logger.error('Could not update the AMQP definition, e:`%s`', format_exc())
                 session.rollback()
 
                 raise
@@ -216,9 +220,9 @@ class Delete(AdminService):
                     'def_name':def_name,
                 })
 
-            except Exception, e:
+            except Exception:
                 session.rollback()
-                self.logger.error('Could not delete the AMQP channel, e:`%s`', format_exc(e))
+                self.logger.error('Could not delete the AMQP channel, e:`%s`', format_exc())
 
                 raise
 

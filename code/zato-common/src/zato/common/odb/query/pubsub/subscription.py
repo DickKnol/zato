@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 
 """
-Copyright (C) 2017, Zato Source s.r.o. https://zato.io
+Copyright (C) 2019, Zato Source s.r.o. https://zato.io
 
 Licensed under LGPLv3, see LICENSE.txt for terms and conditions.
 """
@@ -33,6 +33,8 @@ def _pubsub_subscription(session, cluster_id):
         PubSubSubscription.is_staging_enabled,
         PubSubSubscription.creation_time,
         PubSubSubscription.last_interaction_time,
+        PubSubSubscription.last_interaction_type,
+        PubSubSubscription.last_interaction_details,
         PubSubSubscription.sub_key,
         PubSubSubscription.is_durable,
         PubSubSubscription.has_gd,
@@ -47,6 +49,7 @@ def _pubsub_subscription(session, cluster_id):
         PubSubSubscription.delivery_err_should_block,
         PubSubSubscription.wait_sock_err,
         PubSubSubscription.wait_non_sock_err,
+        PubSubSubscription.sub_pattern_matched,
 
         PubSubSubscription.out_amqp_id,
         PubSubSubscription.amqp_exchange,
@@ -71,11 +74,11 @@ def _pubsub_subscription(session, cluster_id):
         PubSubSubscription.out_http_method,
         PubSubSubscription.delivery_endpoint,
 
-        PubSubSubscription.ws_sub_id,
         PubSubSubscription.ws_channel_id,
         PubSubSubscription.cluster_id,
 
         PubSubTopic.name.label('topic_name'),
+        PubSubTopic.task_delivery_interval,
         PubSubEndpoint.name.label('endpoint_name'),
         PubSubEndpoint.endpoint_type,
         PubSubEndpoint.service_id,
@@ -84,7 +87,7 @@ def _pubsub_subscription(session, cluster_id):
         filter(PubSubEndpoint.id==PubSubSubscription.endpoint_id).\
         filter(Cluster.id==PubSubSubscription.cluster_id).\
         filter(Cluster.id==cluster_id).\
-        order_by(PubSubSubscription.id)
+        order_by(PubSubSubscription.id.desc())
 
 # ################################################################################################################################
 

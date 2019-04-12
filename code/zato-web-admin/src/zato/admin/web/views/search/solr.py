@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 
 """
-Copyright (C) 2014 Dariusz Suchojad <dsuch at zato.io>
+Copyright (C) 2019, Zato Source s.r.o. https://zato.io
 
 Licensed under LGPLv3, see LICENSE.txt for terms and conditions.
 """
@@ -70,7 +70,7 @@ class Delete(_Delete):
 
 @method_allowed('POST')
 def ping(req, id, cluster_id):
-    ret = id_only_service(req, 'zato.search.solr.ping', id, 'Could not ping the Solr connection, e:[{e}]')
+    ret = id_only_service(req, 'zato.search.solr.ping', id, 'Could not ping the Solr connection, e:`{}`')
     if isinstance(ret, HttpResponseServerError):
         return ret
     return HttpResponse(ret.data.info)

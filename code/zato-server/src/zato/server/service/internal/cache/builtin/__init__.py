@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 
 """
-Copyright (C) 2017, Zato Source s.r.o. https://zato.io
+Copyright (C) 2019, Zato Source s.r.o. https://zato.io
 
 Licensed under LGPLv3, see LICENSE.txt for terms and conditions.
 """
@@ -10,6 +10,9 @@ from __future__ import absolute_import, division, print_function, unicode_litera
 
 # dictalchemy
 from dictalchemy.utils import asdict
+
+# Python 2/3 compatibility
+from six import add_metaclass
 
 # Zato
 from zato.common import CACHE as _COMMON_CACHE
@@ -24,10 +27,11 @@ from zato.server.service.meta import CreateEditMeta, DeleteMeta, GetListMeta
 elem = 'cache_builtin'
 model = CacheBuiltin
 label = 'a built-in cache definition'
+get_list_docs = 'built-in cache definitions'
 broker_message = CACHE
 broker_message_prefix = 'BUILTIN_'
 list_func = cache_builtin_list
-output_optional_extra = ['current_size']
+output_optional_extra = ['current_size', 'cache_id']
 
 # ################################################################################################################################
 
@@ -36,14 +40,25 @@ instance_hook = common_instance_hook
 # ################################################################################################################################
 
 def response_hook(self, input, _ignored, attrs, service_type):
-    if service_type == 'get_list':
+
+    if service_type == 'create_edit':
+        self.response.payload.cache_id = self.response.payload.id
+
+    elif service_type == 'get_list':
         for item in self.response.payload:
             item.current_size = self.cache.get_size(_COMMON_CACHE.TYPE.BUILTIN, item.name)
 
 # ################################################################################################################################
 
-class Get(AdminService):
+def broker_message_hook(self, input, instance, attrs, service_type):
+    if service_type == 'delete':
+        input.cache_type = _COMMON_CACHE.TYPE.BUILTIN
 
+# ################################################################################################################################
+
+class Get(AdminService):
+    """ Returns configuration of a cache definition.
+    """
     class SimpleIO(AdminSIO):
         input_required = ('cluster_id', 'cache_id')
         output_required = ('name', 'is_active', 'is_default', 'cache_type', Int('max_size'), Int('max_item_size'),
@@ -58,29 +73,33 @@ class Get(AdminService):
 
 # ################################################################################################################################
 
+@add_metaclass(GetListMeta)
 class GetList(AdminService):
     _filter_by = CacheBuiltin.name,
-    __metaclass__ = GetListMeta
 
 # ################################################################################################################################
 
+@add_metaclass(CreateEditMeta)
 class Create(AdminService):
-    __metaclass__ = CreateEditMeta
+    pass
 
 # ################################################################################################################################
 
+@add_metaclass(CreateEditMeta)
 class Edit(AdminService):
-    __metaclass__ = CreateEditMeta
+    pass
 
 # ################################################################################################################################
 
+@add_metaclass(DeleteMeta)
 class Delete(AdminService):
-    __metaclass__ = DeleteMeta
+    pass
 
 # ################################################################################################################################
 
 class Clear(AdminService):
-
+    """ Clears out a cache by its ID - deletes all keys and values.
+    """
     class SimpleIO(AdminSIO):
         input_required = ('cluster_id', 'cache_id')
 

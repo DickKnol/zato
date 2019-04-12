@@ -1,10 +1,15 @@
 {% extends "zato/index.html" %}
 
-{% block html_title %}Pub/sub subscriptions{% endblock %}
+{% block html_title %}Pub/sub subscriptions {% if topic_id %}for topic {{ topic_name }}{% endif %}{% endblock %}
 
 {% block "extra_css" %}
     <link rel="stylesheet" type="text/css" href="/static/css/jquery.alerts.css">
     <link rel="stylesheet" type="text/css" href="/static/css/multi-select.css">
+    <style type="text/css">
+        .ui-dialog-titlebar {
+            padding-bottom:10px !important;
+        }
+    </style>
 {% endblock %}
 
 {% block "extra_js" %}
@@ -14,8 +19,9 @@
     <script type="text/javascript" src="/static/jquery/jquery.alerts.min.js"></script>
 
     <script type="text/javascript" src="/static/js/common.js"></script>
-    <script type="text/python" src="/static/brython/_zato/common.py"></script>
     <script type="text/javascript" src="/static/js/pubsub/subscription.js"></script>
+
+    <script type="text/python" src="/static/brython/zato/common.py"></script>
 
     <script type="text/javascript">
     window.zato_dyn_form_default = 'rest';
@@ -30,13 +36,13 @@
         'service': ['service_id'],
         'sms_twilio': ['sms_twilio_from', 'sms_twilio_to_list'],
         'smtp': ['out_smtp_id', 'smtp_subject', 'smtp_from', 'smtp_to_list', 'smtp_body'],
-        'soap': ['out_soap_http_soap_id', 'out_http_method'],
+        'soap': ['out_soap_http_soap_id'],
     }
 
     window.zato_select_data_target = 'endpoint_id';
     window.zato_select_data_target_items = {
         'endpoint_id': {
-            'amqp': [],
+            'amqp': {{ select_data_target.amqp|safe }},
             'files': [],
             'ftp': [],
             'rest': {{ select_data_target.rest|safe }},
@@ -75,7 +81,7 @@
 {% endblock %}
 
 {% block "content" %}
-<h2 class="zato">Pub/sub subscriptions</h2>
+<h2 class="zato">Pub/sub subscriptions{% if topic_id %} for topic <a href="{% url "pubsub-topic" %}?cluster={{ cluster_id }}&amp;highlight={{ topic_id }}">{{ topic_name }}{% endif %}</a></h2>
 
 {% if not zato_clusters %}
     {% include "zato/no-clusters.html" %}
@@ -87,9 +93,11 @@
 
     {% if cluster_id %}
 
+        {% if not topic_id %}
         <div class='page_prompt' style="clear:left">
             <a href="javascript:$.fn.zato.pubsub.subscription.create()">Create new pub/sub subscriptions</a>
         </div>
+        {% endif %}
 
         <div id="markup">
             <table id="data-table">
@@ -127,17 +135,19 @@
 
                         <td>
                             <a id="pubsub_endpoint_queues_link_{{ item.id }}"
-                               href="{% url "pubsub-endpoint-queues" cluster_id item.id item.endpoint_name|slugify %}">{{ item.subscription_count}} </a>
+                               href="{% url "pubsub-endpoint-queues" cluster_id item.id item.endpoint_name|slugify %}?cluster={{ cluster_id }}">{{ item.subscription_count}} </a>
                         </td>
 
                         <td>{{ item.last_seen|default:"<span class='form_hint'>---</span>" }}</td>
                         <td>{{ item.last_deliv_time|default:"<span class='form_hint'>---</span>" }}</td>
 
                         <td>
-                            {% if item.is_internal %}
-                                <span class="form_hint">Delete all subscriptions</span>
-                            {% else %}
-                                <a href="javascript:$.fn.zato.pubsub.subscription.delete_('{{ item.id }}')">Delete all subscriptions</a>
+                            {% if not topic_id %}
+                                {% if item.is_internal %}
+                                    <span class="form_hint">Delete all subscriptions</span>
+                                {% else %}
+                                    <a href="javascript:$.fn.zato.pubsub.subscription.delete_('{{ item.id }}')">Delete all subscriptions</a>
+                                {% endif %}
                             {% endif %}
                         </td>
                         <td class='ignore item_id_{{ item.id }}'>{{ item.id }}</td>

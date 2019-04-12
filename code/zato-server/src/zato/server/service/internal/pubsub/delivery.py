@@ -1,18 +1,23 @@
 # -*- coding: utf-8 -*-
 
 """
-Copyright (C) 2017, Zato Source s.r.o. https://zato.io
+Copyright (C) 2019, Zato Source s.r.o. https://zato.io
 
 Licensed under LGPLv3, see LICENSE.txt for terms and conditions.
 """
 
 from __future__ import absolute_import, division, print_function, unicode_literals
 
+# Python 2/3 compatibility
+from future.utils import itervalues
+
 # Zato
-from zato.common import PUBSUB
+from zato.common import HTTP_SOAP_SERIALIZATION_TYPE, PUBSUB, URL_TYPE
 from zato.common.broker_message import PUBSUB as BROKER_MSG_PUBSUB
 from zato.common.exception import BadRequest
+from zato.common.pubsub import HandleNewMessageCtx
 from zato.server.pubsub.task import PubSubTool
+from zato.common.util.json_ import dumps
 from zato.server.service import Int, Opaque
 from zato.server.service.internal import AdminService, AdminSIO
 
@@ -25,11 +30,12 @@ class NotifyPubSubMessage(AdminService):
     def handle(self):
         # The request that we have on input needs to be sent to a pubsub_tool for each sub_key,
         # even if it is possibly the same pubsub_tool for more than one input sub_key.
-        request = self.request.raw_request['request']
+        req = self.request.raw_request['request']
 
-        for sub_key in request['sub_key_list']:
+        for sub_key in req['sub_key_list']:
             pubsub_tool = self.pubsub.pubsub_tool_by_sub_key[sub_key]
-            pubsub_tool.handle_new_messages(self.cid, request['has_gd'], [sub_key], request['non_gd_msg_list'])
+            pubsub_tool.handle_new_messages(HandleNewMessageCtx(self.cid, req['has_gd'], [sub_key],
+                req['non_gd_msg_list'], req['is_bg_call'], req['pub_time_max']))
 
 # ################################################################################################################################
 
@@ -51,16 +57,9 @@ class CreateDeliveryTask(AdminService):
             'server_name': self.server.name,
             'server_pid': self.server.pid,
             'sub_key': config['sub_key'],
-            'endpoint_type': config['endpoint_type']
+            'endpoint_type': config['endpoint_type'],
+            'task_delivery_interval': config['task_delivery_interval'],
         }
-
-        # Register this delivery task with current server's pubsub but only if we do not have it already.
-        # It is possible that we do, for instance:
-        #
-        # 1) This server had this task when it was starting up
-        # 2) The task was migrated to another
-        #
-        self.pubsub.set_sub_key_server(msg)
 
         # Update in-RAM state of workers
         msg['action'] = BROKER_MSG_PUBSUB.SUB_KEY_SERVER_SET.value
@@ -88,21 +87,62 @@ class DeliverMessage(AdminService):
 
 # ################################################################################################################################
 
-    def _deliver_rest_soap(self, msg, subscription, impl_getter):
+    def _get_data_from_message(self, msg):
+
+        # A list of messages is given on input so we need to serialize each of them individually
+        if isinstance(msg, list):
+            out = []
+            for elem in msg:
+                out.append(elem.serialized if elem.serialized else elem.to_external_dict())
+            return out
+        # A single message was given on input
+        else:
+            return msg.serialized if msg.serialized else msg.to_external_dict()
+
+# ################################################################################################################################
+
+    def _deliver_rest_soap(self, msg, subscription, impl_getter, _suds=HTTP_SOAP_SERIALIZATION_TYPE.SUDS.id,
+        _rest=URL_TYPE.PLAIN_HTTP):
         if not subscription.config.out_http_soap_id:
             raise ValueError('Missing out_http_soap_id for subscription `{}`'.format(subscription))
         else:
+            data = self._get_data_from_message(msg)
+            http_soap = impl_getter(subscription.config.out_http_soap_id)
 
-            # A list of messages is given on input so we need to serialize each of them individually
-            if isinstance(msg, list):
-                data = [elem.to_external_dict() for elem in msg]
+            _is_rest = http_soap['config']['transport'] == _rest
+            _has_suds = http_soap['config']['serialization_type'] == _suds
 
-            # A single message was given on input
+            # If it is REST or a suds-based connection, we can just invoke it directly
+            if _is_rest or (not _has_suds):
+                http_soap.conn.http_request(subscription.config.out_http_method, self.cid, data=data)
+
+            # .. while suds-based outgoing connections need to invoke the hook service which will
+            # in turn issue a SOAP request to the remote server.
             else:
-                data = msg.to_external_dict()
+                self.pubsub.invoke_on_outgoing_soap_invoke_hook(msg, subscription, http_soap)
 
-            endpoint = impl_getter(subscription.config.out_http_soap_id)
-            endpoint.conn.http_request(subscription.config.out_http_method, self.cid, data=data)
+# ################################################################################################################################
+
+    def _deliver_amqp(self, msg, subscription, _ignored_impl_getter):
+
+        # Ultimately we should use impl_getter to get the outconn
+        for value in itervalues(self.server.worker_store.worker_config.out_amqp):
+            if value['config']['id'] == subscription.config.out_amqp_id:
+
+                data = self._get_data_from_message(msg)
+                name = value['config']['name']
+                kwargs = {}
+
+                if subscription.config.amqp_exchange:
+                    kwargs['exchange'] = subscription.config.amqp_exchange
+
+                if subscription.config.amqp_routing_key:
+                    kwargs['routing_key'] = subscription.config.amqp_routing_key
+
+                self.outgoing.amqp.send(dumps(data), name, **kwargs)
+
+                # We found our outconn and the message was sent, we can stop now
+                break
 
 # ################################################################################################################################
 
@@ -113,6 +153,7 @@ class DeliverMessage(AdminService):
 
 # We need to register it here because it refers to DeliverMessage's methods
 deliver_func = {
+    PUBSUB.ENDPOINT_TYPE.AMQP.id: DeliverMessage._deliver_amqp,
     PUBSUB.ENDPOINT_TYPE.REST.id: DeliverMessage._deliver_rest_soap,
     PUBSUB.ENDPOINT_TYPE.SOAP.id: DeliverMessage._deliver_rest_soap,
     PUBSUB.ENDPOINT_TYPE.WEB_SOCKETS.id: DeliverMessage._deliver_wsx,
@@ -127,12 +168,23 @@ class GetServerPIDForSubKey(AdminService):
         input_required = ('sub_key',)
         output_optional = (Int('server_pid'),)
 
+# ################################################################################################################################
+
+    def _raise_bad_request(self, sub_key):
+        raise BadRequest(self.cid, 'No such sub_key found `{}`'.format(sub_key))
+
+# ################################################################################################################################
+
     def handle(self):
+        sub_key = self.request.input.sub_key
         try:
-            server = self.pubsub.get_sub_key_server(self.request.input.sub_key, False)
+            server = self.pubsub.get_delivery_server_by_sub_key(sub_key, needs_lock=False)
         except KeyError:
-            raise BadRequest(self.cid, 'No such sub_key found `{}`'.format(self.request.input.sub_key))
+            self._raise_bad_request(sub_key)
         else:
-            self.response.payload.server_pid = server.server_pid
+            if server:
+                self.response.payload.server_pid = server.server_pid
+            else:
+                self._raise_bad_request(sub_key)
 
 # ################################################################################################################################

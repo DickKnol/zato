@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 
 """
-Copyright (C) 2014 Dariusz Suchojad <dsuch at zato.io>
+Copyright (C) 2019, Zato Source s.r.o. https://zato.io
 
 Licensed under LGPLv3, see LICENSE.txt for terms and conditions.
 """
@@ -23,8 +23,9 @@ from bunch import bunchify
 from sqlalchemy import Boolean, Integer
 
 # Zato
-from zato.common import NO_DEFAULT_VALUE, ZATO_NOT_GIVEN
+from zato.common import ZATO_NOT_GIVEN
 from zato.common.odb.model import Base, Cluster
+from zato.common.util.sql import elems_with_opaque, set_instance_opaque_attrs
 from zato.server.service import AsIs, Bool as BoolSIO, Int as IntSIO
 from zato.server.service.internal import AdminSIO, GetListAdminSIO
 
@@ -45,17 +46,46 @@ req_resp = {
     'Ping': 'ping',
 }
 
+def _is_column_required(column):
+    return not (bool(column.nullable) is True)
+
+def get_columns_to_visit(columns, is_required):
+    out = []
+
+    # Models with inheritance may have multiple attributes of the same name,
+    # e.g. VaultConnection.id will have SecBase.id and we need to make sure only one of them is returned.
+    names_seen = set()
+
+    for elem in columns:
+        if is_required:
+            if not _is_column_required(elem):
+                continue
+        else:
+            if _is_column_required(elem):
+                continue
+
+        if elem.name not in names_seen:
+            names_seen.add(elem.name)
+            out.append(elem)
+        else:
+            continue
+
+    return out
 
 def get_io(attrs, elems_name, is_edit, is_required, is_output, is_get_list, has_cluster_id):
 
     # This can be either a list or an SQLAlchemy object
     elems = attrs.get(elems_name) or []
+    columns = []
 
     # Generate elems out of SQLAlchemy tables, including calls to ForceType's subclasses, such as Bool or Int.
 
     if elems and isclass(elems) and issubclass(elems, Base):
-        columns = []
-        for column in [elem for elem in elems._sa_class_manager.mapper.mapped_table.columns]:
+
+        columns_to_visit = [elem for elem in elems._sa_class_manager.mapper.mapped_table.columns]
+        columns_to_visit = get_columns_to_visit(columns_to_visit, is_required)
+
+        for column in columns_to_visit:
 
             # Each model has a cluster_id column but it's not really needed for anything on output
             if column.name == 'cluster_id' and is_output:
@@ -66,12 +96,6 @@ def get_io(attrs, elems_name, is_edit, is_required, is_output, is_get_list, has_
                 continue
 
             if column.name in attrs.skip_input_params:
-                continue
-
-            # We're building SimpleIO.input/output_required here so any nullable columns
-            # should not be taken into account. They will be included the next time get_io
-            # is called, i.e. to build SimpleIO.input/output_optional.
-            if is_required and column.nullable:
                 continue
 
             # We never return passwords
@@ -98,10 +122,7 @@ def get_io(attrs, elems_name, is_edit, is_required, is_output, is_get_list, has_
                 else:
                     columns.append(column.name)
 
-        # Override whatever objects it used to be
-        elems = columns
-
-    return elems
+    return columns
 
 def update_attrs(cls, name, attrs):
 
@@ -124,16 +145,16 @@ def update_attrs(cls, name, attrs):
     attrs.broker_message_hook = getattr(mod, 'broker_message_hook', None)
     attrs.extra_delete_attrs = getattr(mod, 'extra_delete_attrs', [])
     attrs.input_required_extra = getattr(mod, 'input_required_extra', [])
+    attrs.input_optional_extra = getattr(mod, 'input_optional_extra', [])
     attrs.create_edit_input_required_extra = getattr(mod, 'create_edit_input_required_extra', [])
     attrs.create_edit_rewrite = getattr(mod, 'create_edit_rewrite', [])
     attrs.check_existing_one = getattr(mod, 'check_existing_one', True)
     attrs.request_as_is = getattr(mod, 'request_as_is', [])
+    attrs.sio_default_value = getattr(mod, 'sio_default_value', None)
+    attrs.get_list_docs = getattr(mod, 'get_list_docs', None)
     attrs._meta_session = None
 
-    default_value = getattr(mod, 'default_value', singleton)
-    default_value = NO_DEFAULT_VALUE if default_value is singleton else default_value
-    attrs.default_value = default_value
-
+    attrs.is_create = False
     attrs.is_edit = False
     attrs.is_create_edit = False
     attrs.is_delete = False
@@ -151,6 +172,7 @@ def update_attrs(cls, name, attrs):
 
             attrs.input_required = attrs.model
             attrs.input_optional = attrs.model
+            attrs.is_create = name == 'Create'
             attrs.is_edit = name == 'Edit'
             attrs.is_create_edit = True
 
@@ -164,18 +186,20 @@ class AdminServiceMeta(type):
     @staticmethod
     def get_sio(attrs, name, input_required=None, output_required=None, is_list=True):
 
+        _BaseClass = GetListAdminSIO if is_list else AdminSIO
+
         sio = {
             'input_required': input_required or ['cluster_id'],
-            'output_required': output_required if output_required is not None else ['id', 'name']
+            'input_optional': list(_BaseClass.input_optional) if hasattr(_BaseClass, 'input_optional') else [],
+            'output_required': output_required if output_required is not None else ['id', 'name'],
         }
-
-        _BaseClass = GetListAdminSIO if is_list else AdminSIO
 
         class SimpleIO(_BaseClass):
             request_elem = 'zato_{}_{}_request'.format(attrs.elem, req_resp[name])
             response_elem = 'zato_{}_{}_response'.format(attrs.elem, req_resp[name])
+            default_value = attrs['sio_default_value']
             input_required = sio['input_required'] + attrs['input_required_extra']
-            input_optional = list(_BaseClass.input_optional) if hasattr(_BaseClass, 'input_optional') else []
+            input_optional = sio['input_optional'] + attrs['input_optional_extra']
 
             for param in attrs['skip_input_params']:
                 if param in input_required:
@@ -183,7 +207,6 @@ class AdminServiceMeta(type):
 
             output_required = sio['output_required'] + attrs['output_required_extra']
             output_optional = attrs['output_optional_extra']
-            default_value = attrs.default_value
 
         for io in 'input', 'output':
             for req in 'required', 'optional':
@@ -194,24 +217,25 @@ class AdminServiceMeta(type):
                 is_get_list = name=='GetList'
 
                 sio_elem = getattr(SimpleIO, _name)
-                sio_elem.extend(
-                    get_io(attrs, _name, attrs.get('is_edit'), is_required, is_output, is_get_list, 'cluster_id' in sio_elem))
+                has_cluster_id = 'cluster_id' in sio_elem
+                sio_to_add = get_io(attrs, _name, attrs.get('is_edit'), is_required, is_output, is_get_list, has_cluster_id)
+                sio_elem.extend(sio_to_add)
 
                 if attrs.is_create_edit and is_required:
                     sio_elem.extend(attrs.create_edit_input_required_extra)
 
                 # Sorts and removes duplicates
-                setattr(SimpleIO, _name, sorted(list(set(sio_elem))))
+                setattr(SimpleIO, _name, list(set(sio_elem)))
 
         for skip_name in attrs.skip_output_params:
             for attr_names in chain([SimpleIO.output_required, SimpleIO.output_optional]):
                 if skip_name in attr_names:
                     attr_names.remove(skip_name)
 
-        SimpleIO.input_required = tuple(sorted(SimpleIO.input_required))
-        SimpleIO.input_optional = tuple(sorted(SimpleIO.input_optional))
-        SimpleIO.output_required = tuple(sorted(SimpleIO.output_required))
-        SimpleIO.output_optional = tuple(sorted(SimpleIO.output_optional))
+        SimpleIO.input_required = tuple(SimpleIO.input_required)
+        SimpleIO.input_optional = tuple(SimpleIO.input_optional)
+        SimpleIO.output_required = tuple(SimpleIO.output_required)
+        SimpleIO.output_optional = tuple(SimpleIO.output_optional)
 
         return SimpleIO
 
@@ -220,6 +244,7 @@ class GetListMeta(AdminServiceMeta):
     """
     def __init__(cls, name, bases, attrs):
         attrs = update_attrs(cls, name, attrs)
+        cls.__doc__ = 'Returns a list of {}.'.format(attrs.get_list_docs)
         cls.SimpleIO = GetListMeta.get_sio(attrs, name, is_list=True)
         cls.handle = GetListMeta.handle(attrs)
         cls.get_data = GetListMeta.get_data(attrs.get_data_func)
@@ -235,7 +260,7 @@ class GetListMeta(AdminServiceMeta):
     def handle(attrs):
         def handle_impl(self):
             with closing(self.odb.session()) as session:
-                self.response.payload[:] = self.get_data(session)
+                self.response.payload[:] = elems_with_opaque(self.get_data(session))
 
             if attrs.response_hook:
                 attrs.response_hook(self, self.request.input, None, attrs, 'get_list')
@@ -248,6 +273,8 @@ class CreateEditMeta(AdminServiceMeta):
 
     def __init__(cls, name, bases, attrs):
         attrs = update_attrs(cls, name, attrs)
+        verb = 'Creates' if attrs.is_create else 'Updates'
+        cls.__doc__ = '{} {}.'.format(verb, attrs.label)
         cls.SimpleIO = CreateEditMeta.get_sio(attrs, name)
         cls.handle = CreateEditMeta.handle(attrs)
         return super(CreateEditMeta, cls).__init__(cls)
@@ -287,13 +314,16 @@ class CreateEditMeta(AdminServiceMeta):
                         instance = session.query(attrs.model).filter_by(id=input.id).one()
                         old_name = instance.name
                     else:
-                        instance = attrs.model()
+                        instance = self._new_zato_instance_with_cluster(attrs.model)
 
                     # Update the instance with data received on input, however,
                     # note that this may overwrite some of existing attributes
                     # if they are empty on input. If it's not desired,
                     # set skip_input_params = ['...'] to ignore such input parameters.
                     instance.fromdict(input, exclude=['password'], allow_pk=True)
+
+                    # Populate all the opaque attrs now
+                    set_instance_opaque_attrs(instance, input)
 
                     # Now that we have an instance which is known not to be a duplicate
                     # we can possibly invoke a customization function before we commit
@@ -304,9 +334,9 @@ class CreateEditMeta(AdminServiceMeta):
                     session.add(instance)
                     session.commit()
 
-                except Exception, e:
+                except Exception:
                     msg = 'Could not {} the object, e:`%s`'.format(verb)
-                    logger.error(msg, format_exc(e))
+                    logger.error(msg, format_exc())
                     session.rollback()
                     raise
                 else:
@@ -340,6 +370,7 @@ class CreateEditMeta(AdminServiceMeta):
 class DeleteMeta(AdminServiceMeta):
     def __init__(cls, name, bases, attrs):
         attrs = update_attrs(cls, name, attrs)
+        cls.__doc__ = 'Deletes {}.'.format(attrs.label)
         cls.SimpleIO = DeleteMeta.get_sio(attrs, name, ['id'], [])
         cls.handle = DeleteMeta.handle(attrs)
         return super(DeleteMeta, cls).__init__(cls)
@@ -360,9 +391,9 @@ class DeleteMeta(AdminServiceMeta):
 
                     session.delete(instance)
                     session.commit()
-                except Exception, e:
+                except Exception:
                     msg = 'Could not delete {}, e:`%s`'.format(attrs.label)
-                    self.logger.error(msg, format_exc(e))
+                    self.logger.error(msg, format_exc())
                     session.rollback()
 
                     raise

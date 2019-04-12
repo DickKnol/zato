@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 
 """
-Copyright (C) 2010 Dariusz Suchojad <dsuch at zato.io>
+Copyright (C) 2019, Zato Source s.r.o. https://zato.io
 
 Licensed under LGPLv3, see LICENSE.txt for terms and conditions.
 """
@@ -9,7 +9,9 @@ Licensed under LGPLv3, see LICENSE.txt for terms and conditions.
 from __future__ import absolute_import, division, print_function, unicode_literals
 
 # stdlib
-import os, sys
+import logging
+import os
+import sys
 
 # Bunch
 from bunch import Bunch
@@ -21,6 +23,15 @@ from zato.cli.stop import Stop
 from zato.common import MISC
 from zato.common.util import get_haproxy_agent_pidfile
 from zato.common.util.proc import start_python_process
+
+# ################################################################################################################################
+
+# During development, it is convenient to configure it here to catch information that should be logged
+# even prior to setting up main loggers in each of components.
+if 0:
+    log_level = logging.INFO
+    log_format = '%(asctime)s - %(levelname)s - %(process)d:%(threadName)s - %(name)s:%(lineno)d - %(message)s'
+    logging.basicConfig(level=log_level, format=log_format)
 
 # ################################################################################################################################
 
@@ -81,7 +92,7 @@ Examples:
         """ Starts a component in background or foreground, depending on the 'fg' flag.
         """
         start_python_process(
-            self.args.fg, py_path, name, program_dir, on_keyboard_interrupt, self.SYS_ERROR.FAILED_TO_START, {
+            name, self.args.fg, py_path, program_dir, on_keyboard_interrupt, self.SYS_ERROR.FAILED_TO_START, {
                 'sync_internal': self.args.sync_internal,
                 'secret_key': self.args.secret_key or ''
             }, stdin_data=self.stdin_data)

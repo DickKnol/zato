@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 
 """
-Copyright (C) 2017 Dariusz Suchojad <dsuch at zato.io>
+Copyright (C) 2019, Zato Source s.r.o. https://zato.io
 
 Licensed under LGPLv3, see LICENSE.txt for terms and conditions.
 """
@@ -9,8 +9,8 @@ Licensed under LGPLv3, see LICENSE.txt for terms and conditions.
 from __future__ import absolute_import, division, print_function, unicode_literals
 
 # stdlib
-from httplib import BAD_REQUEST, CONFLICT, FORBIDDEN, INTERNAL_SERVER_ERROR, METHOD_NOT_ALLOWED, NOT_FOUND, SERVICE_UNAVAILABLE, \
-     UNAUTHORIZED
+from http.client import BAD_REQUEST, CONFLICT, FORBIDDEN, INTERNAL_SERVER_ERROR, METHOD_NOT_ALLOWED, NOT_FOUND, \
+     SERVICE_UNAVAILABLE, UNAUTHORIZED
 
 # Zato
 from zato.common import TOO_MANY_REQUESTS, HTTPException
@@ -23,7 +23,7 @@ class Reportable(HTTPException):
 ClientHTTPError = Reportable
 
 class BadRequest(Reportable):
-    def __init__(self, cid, msg):
+    def __init__(self, cid, msg='Received a bad request'):
         super(BadRequest, self).__init__(cid, msg, BAD_REQUEST)
 
 class Conflict(Reportable):
@@ -52,7 +52,7 @@ class TooManyRequests(Reportable):
         super(TooManyRequests, self).__init__(cid, msg, TOO_MANY_REQUESTS)
 
 class InternalServerError(Reportable):
-    def __init__(self, cid, msg):
+    def __init__(self, cid, msg='Internal server error'):
         super(InternalServerError, self).__init__(cid, msg, INTERNAL_SERVER_ERROR)
 
 class ServiceUnavailable(Reportable):

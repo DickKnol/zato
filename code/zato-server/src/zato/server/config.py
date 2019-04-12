@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 
 """
-Copyright (C) 2018, Zato Source s.r.o. https://zato.io
+Copyright (C) 2019, Zato Source s.r.o. https://zato.io
 
 Licensed under LGPLv3, see LICENSE.txt for terms and conditions.
 """
@@ -19,9 +19,13 @@ from paste.util.multidict import MultiDict
 # Bunch
 from zato.bunch import Bunch
 
+# Python 2/3 compatibility
+from future.utils import itervalues
+
 # Zato
 from zato.common import SECRETS, ZATO_NONE
 from zato.common.util.config import resolve_value
+from zato.common.util.sql import ElemsWithOpaqueMaker
 
 # ################################################################################################################################
 
@@ -112,7 +116,7 @@ class ConfigDict(object):
 
     def itervalues(self):
         with self.lock:
-            return self._impl.itervalues()
+            return itervalues(self._impl)
 
 # ################################################################################################################################
 
@@ -175,7 +179,7 @@ class ConfigDict(object):
 # ################################################################################################################################
 
     @staticmethod
-    def from_query(name, query_data, impl_class=Bunch, item_class=Bunch, list_config=False, decrypt_func=None):
+    def from_query(name, query_data, impl_class=Bunch, item_class=Bunch, list_config=False, decrypt_func=None, drop_opaque=False):
         """ Return a new ConfigDict with items taken from an SQL query.
         """
         config_dict = ConfigDict(name)
@@ -221,6 +225,19 @@ class ConfigDict(object):
                             else:
                                 config['_encrypted_in_odb'] = False
 
+
+        # Post-process data before it is returned to resolve any opaque attributes
+        for value in config_dict.values():
+            value_config = value['config']
+            if ElemsWithOpaqueMaker.has_opaque_data(value_config):
+                ElemsWithOpaqueMaker.process_config_dict(value_config, drop_opaque)
+
+        return config_dict
+
+# ################################################################################################################################
+
+    @staticmethod
+    def from_generic(config_dict):
         return config_dict
 
 # ################################################################################################################################
@@ -231,30 +248,31 @@ class ConfigStore(object):
     using the .copy method.
     """
     def __init__(self, out_ftp=ZATO_NONE, out_odoo=ZATO_NONE, out_plain_http=ZATO_NONE, out_soap=ZATO_NONE, out_sql=ZATO_NONE,
-            out_stomp=ZATO_NONE, repo_location=ZATO_NONE, basic_auth=ZATO_NONE, wss=ZATO_NONE, url_sec=ZATO_NONE,
-            http_soap=ZATO_NONE, broker_config=ZATO_NONE, odb_data=ZATO_NONE, simple_io=ZATO_NONE, msg_ns=ZATO_NONE,
-            json_pointer=ZATO_NONE, xpath=ZATO_NONE):
+            out_stomp=ZATO_NONE, out_sap=ZATO_NONE, repo_location=ZATO_NONE, basic_auth=ZATO_NONE, wss=ZATO_NONE,
+            tech_acc=ZATO_NONE, url_sec=ZATO_NONE, http_soap=ZATO_NONE, broker_config=ZATO_NONE, odb_data=ZATO_NONE,
+            simple_io=ZATO_NONE, msg_ns=ZATO_NONE, json_pointer=ZATO_NONE, xpath=ZATO_NONE, pubsub_topics=ZATO_NONE):
 
         # Outgoing connections
-        self.out_ftp = out_ftp
-        self.out_odoo = out_odoo
-        self.out_plain_http = out_plain_http
-        self.out_soap = out_soap
-        self.out_sql = out_sql
-        self.out_stomp = out_stomp
+        self.out_ftp = out_ftp    # type: ConfigDict
+        self.out_odoo = out_odoo  # type: ConfigDict
+        self.out_plain_http = out_plain_http # type: ConfigDict
+        self.out_soap = out_soap    # type: ConfigDict
+        self.out_sql = out_sql      # type: ConfigDict
+        self.out_stomp = out_stomp  # type: ConfigDict
+        self.out_sap = out_sap      # type: ConfigDict
 
         # Local on-disk configuraion repository
-        self.repo_location = repo_location
+        self.repo_location = repo_location # type: str
 
         # Security definitions
-        self.basic_auth = basic_auth
-        self.wss = wss
+        self.basic_auth = basic_auth # type: ConfigDict
+        self.wss = wss # type: ConfigDict
 
         # URL security
-        self.url_sec = url_sec
+        self.url_sec = url_sec # type: ConfigDict
 
         # HTTP channels
-        self.http_soap = http_soap
+        self.http_soap = http_soap # type: ConfigDict
 
         # Configuration for broker clients
         self.broker_config = broker_config
@@ -279,7 +297,7 @@ class ConfigStore(object):
     def outgoing_connections(self):
         """ Returns all the outgoing connections.
         """
-        return self.out_ftp, self.out_odoo, self.out_plain_http, self.out_soap
+        return self.out_ftp, self.out_odoo, self.out_plain_http, self.out_soap, self.out_sap
 
 # ################################################################################################################################
 

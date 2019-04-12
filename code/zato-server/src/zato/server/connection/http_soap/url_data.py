@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 
 """
-Copyright (C) 2012 Dariusz Suchojad <dsuch at zato.io>
+Copyright (C) 2019, Zato Source s.r.o. https://zato.io
 
 Licensed under LGPLv3, see LICENSE.txt for terms and conditions.
 """
@@ -10,37 +10,74 @@ from __future__ import absolute_import, division, print_function, unicode_litera
 
 # stdlib
 import logging
-from datetime import datetime
-from json import dumps, loads
+from base64 import b64encode
 from operator import itemgetter
 from threading import RLock
 from traceback import format_exc
 
-# oauth
-from oauth.oauth import OAuthDataStore, OAuthConsumer, OAuthRequest, OAuthServer, OAuthSignatureMethod_HMAC_SHA1, \
-     OAuthSignatureMethod_PLAINTEXT, OAuthToken
-
-# sec-wall
-from secwall.server import on_basic_auth, on_wsse_pwd
-from secwall.wsse import WSSE
+# Python 2/3 compatibility
+from future.utils import iteritems, itervalues
+from past.builtins import basestring
+from six import PY2
 
 # Zato
 from zato.bunch import Bunch
-from zato.common import AUDIT_LOG, DATA_FORMAT, MISC, MSG_PATTERN_TYPE, SEC_DEF_TYPE, URL_TYPE, VAULT, ZATO_NONE
-from zato.common.broker_message import code_to_name, CHANNEL, SECURITY, VAULT as VAULT_BROKER_MSG
+from zato.common import CONNECTION, DATA_FORMAT, MISC, SEC_DEF_TYPE, URL_TYPE, VAULT, ZATO_NONE
+from zato.common.broker_message import code_to_name, SECURITY, VAULT as VAULT_BROKER_MSG
 from zato.common.dispatch import dispatcher
-from zato.common.util import parse_tls_channel_security_definition, update_apikey_username
+from zato.common.util import parse_tls_channel_security_definition, update_apikey_username_to_channel
+from zato.common.util.auth import on_basic_auth, on_wsse_pwd, WSSE
+from zato.common.util.url_dispatcher import get_match_target
 from zato.server.connection.http_soap import Forbidden, Unauthorized
 from zato.server.jwt import JWT
 from zato.url_dispatcher import CyURLData, Matcher
 
+# ################################################################################################################################
+
+# Type checking
+import typing
+
+if typing.TYPE_CHECKING:
+    from zato.server.base.worker import WorkerStore
+
+    # For pyflakes
+    WorkerStore = WorkerStore
+
+# ################################################################################################################################
+
+if PY2:
+    from oauth.oauth import OAuthDataStore, OAuthConsumer, OAuthRequest, OAuthServer, OAuthSignatureMethod_HMAC_SHA1, \
+         OAuthSignatureMethod_PLAINTEXT, OAuthToken
+else:
+    class _Placeholder(object):
+        def __init__(self, *ignored_args, **ignored_kwargs):
+            pass
+
+        def _placeholder(self, *ignored_args, **ignored_kwargs):
+            pass
+
+        add_signature_method = _placeholder
+
+    OAuthDataStore = OAuthConsumer = OAuthRequest = OAuthServer = OAuthSignatureMethod_HMAC_SHA1 = \
+        OAuthSignatureMethod_PLAINTEXT = OAuthToken = _Placeholder
+
+# ################################################################################################################################
+
 logger = logging.getLogger(__name__)
 
+# ################################################################################################################################
+
 _internal_url_path_indicator = '{}/zato/'.format(MISC.SEPARATOR)
+
+# ################################################################################################################################
+# ################################################################################################################################
 
 class OAuthStore(object):
     def __init__(self, oauth_config):
         self.oauth_config = oauth_config
+
+# ################################################################################################################################
+# ################################################################################################################################
 
 class URLData(CyURLData, OAuthDataStore):
     """ Performs URL matching and security checks.
@@ -51,7 +88,7 @@ class URLData(CyURLData, OAuthDataStore):
                  vault_conn_sec_config=None, kvdb=None, broker_client=None, odb=None, json_pointer_store=None, xpath_store=None,
                  jwt_secret=None, vault_conn_api=None):
         super(URLData, self).__init__(channel_data)
-        self.worker = worker
+        self.worker = worker # type: WorkerStore
         self.url_sec = url_sec
         self.basic_auth_config = basic_auth_config
         self.jwt_config = jwt_config
@@ -165,8 +202,8 @@ class URLData(CyURLData, OAuthDataStore):
         if sec_def_type == _basic_auth:
             auth_func = self._handle_security_basic_auth
             get_func = self.basic_auth_get
-            headers['HTTP_AUTHORIZATION'] = 'Basic {}'.format(
-                '{}:{}'.format(auth['username'], auth['secret']).encode('base64'))
+            auth = b64encode('{}:{}'.format(auth['username'], auth['secret']))
+            headers['HTTP_AUTHORIZATION'] = 'Basic {}'.format(auth)
 
         elif sec_def_type == _jwt:
             auth_func = self._handle_security_jwt
@@ -178,8 +215,8 @@ class URLData(CyURLData, OAuthDataStore):
             get_func = self.vault_conn_sec_get
 
             headers['zato.http.response.headers'] = {}
-            for header_info in _vault_ws.itervalues():
-                for key, header in header_info.iteritems():
+            for header_info in itervalues(_vault_ws):
+                for key, header in iteritems(header_info):
                     headers[header] = auth[key]
 
         else:
@@ -292,9 +329,9 @@ class URLData(CyURLData, OAuthDataStore):
 
         try:
             result = on_wsse_pwd(self._wss, url_config, body, False)
-        except Exception, e:
+        except Exception:
             if enforce_auth:
-                msg = 'Could not parse the WS-Security data, body:[{}], e:[{}]'.format(body, format_exc(e))
+                msg = 'Could not parse the WS-Security data, body:`{}`, e:`{}`'.format(body, format_exc())
                 raise Unauthorized(cid, msg, 'zato-wss')
             else:
                 return False
@@ -346,9 +383,9 @@ class URLData(CyURLData, OAuthDataStore):
 
         try:
             self._oauth_server.verify_request(oauth_request)
-        except Exception, e:
+        except Exception as e:
             if enforce_auth:
-                msg = 'Signature verification failed, wsgi_environ:[%r], e:[%s], e.message:[%s]'
+                msg = 'Signature verification failed, wsgi_environ:`%r`, e:`%s`, e.message:`%s`'
                 logger.error(msg, wsgi_environ, format_exc(e), e.message)
                 raise Unauthorized(cid, 'Signature verification failed', 'OAuth')
             else:
@@ -435,16 +472,16 @@ class URLData(CyURLData, OAuthDataStore):
 
         # API key
         if _headers.TOKEN_VAULT in wsgi_environ:
-            return client.authenticate(_auth_method.TOKEN, wsgi_environ[_headers.TOKEN_VAULT])
+            return client.authenticate(_auth_method.TOKEN.id, wsgi_environ[_headers.TOKEN_VAULT])
 
         # Username/password
         elif _headers.USERNAME in wsgi_environ:
             return client.authenticate(
-                _auth_method.USERNAME_PASSWORD, wsgi_environ[_headers.USERNAME], wsgi_environ.get(_headers.PASSWORD))
+                _auth_method.USERNAME_PASSWORD.id, wsgi_environ[_headers.USERNAME], wsgi_environ.get(_headers.PASSWORD))
 
         # GitHub
         elif _headers.TOKEN_GH in wsgi_environ:
-            return client.authenticate(_auth_method.GITHUB, wsgi_environ[_headers.TOKEN_GH])
+            return client.authenticate(_auth_method.GITHUB.id, wsgi_environ[_headers.TOKEN_GH])
 
 # ################################################################################################################################
 
@@ -504,8 +541,8 @@ class URLData(CyURLData, OAuthDataStore):
                 else:
                     vault_response = self._vault_conn_check_headers(client, wsgi_environ, sec_def_config)
 
-        except Exception, e:
-            logger.warn(format_exc(e))
+        except Exception:
+            logger.warn(format_exc())
             if enforce_auth:
                 self._enforce_vault_sec(cid, sec_def.name)
             else:
@@ -637,7 +674,8 @@ class URLData(CyURLData, OAuthDataStore):
 # ################################################################################################################################
 
     def _update_apikey(self, name, config):
-        update_apikey_username(config)
+        config.orig_username = config.username
+        update_apikey_username_to_channel(config)
         self.apikey_config[name] = Bunch()
         self.apikey_config[name].config = config
 
@@ -759,11 +797,18 @@ class URLData(CyURLData, OAuthDataStore):
         self.basic_auth_config[name].config = config
 
     def basic_auth_get(self, name):
-        """ Returns the configuration of the HTTP Basic Auth security definition
-        of the given name.
+        """ Returns the configuration of the HTTP Basic Auth security definition of the given name.
         """
         with self.url_sec_lock:
             return self.basic_auth_config.get(name)
+
+    def basic_auth_get_by_id(self, def_id):
+        """ Same as basic_auth_get but returns information by definition ID.
+        """
+        with self.url_sec_lock:
+            for item in self.basic_auth_config.values():
+                if item.config['id'] == def_id:
+                    return item.config
 
     def on_broker_msg_SECURITY_BASIC_AUTH_CREATE(self, msg, *args):
         """ Creates a new HTTP Basic Auth security definition.
@@ -1077,15 +1122,21 @@ class URLData(CyURLData, OAuthDataStore):
         self.tls_key_cert_config[name] = Bunch()
         self.tls_key_cert_config[name].config = config
 
+# ################################################################################################################################
+
     def tls_key_cert_get(self, name):
         with self.url_sec_lock:
             return self.tls_key_cert_config.get(name)
+
+# ################################################################################################################################
 
     def on_broker_msg_SECURITY_TLS_KEY_CERT_CREATE(self, msg, *args):
         """ Creates a new TLS key/cert security definition.
         """
         with self.url_sec_lock:
             self._update_tls_key_cert(msg.name, msg)
+
+# ################################################################################################################################
 
     def on_broker_msg_SECURITY_TLS_KEY_CERT_EDIT(self, msg, *args):
         """ Updates an existing TLS key/cert security definition.
@@ -1095,12 +1146,23 @@ class URLData(CyURLData, OAuthDataStore):
             self._update_tls_key_cert(msg.name, msg)
             self._update_url_sec(msg, SEC_DEF_TYPE.TLS_KEY_CERT)
 
+# ################################################################################################################################
+
     def on_broker_msg_SECURITY_TLS_KEY_CERT_DELETE(self, msg, *args):
         """ Deletes an TLS key/cert security definition.
         """
         with self.url_sec_lock:
             del self.tls_key_cert_config[msg.name]
             self._update_url_sec(msg, SEC_DEF_TYPE.TLS_KEY_CERT, True)
+
+# ################################################################################################################################
+
+    def get_channel_by_name(self, name, _channel=CONNECTION.CHANNEL):
+        # type: (unicode, unicode) -> dict
+        for item in self.channel_data:
+            if item['connection'] == _channel:
+                if item['name'] == name:
+                    return item
 
 # ################################################################################################################################
 
@@ -1135,7 +1197,7 @@ class URLData(CyURLData, OAuthDataStore):
         for name in('connection', 'content_type', 'data_format', 'host', 'id', 'has_rbac', 'impl_name', 'is_active',
             'is_internal', 'merge_url_params_req', 'method', 'name', 'params_pri', 'ping_method', 'pool_size', 'service_id',
             'service_name', 'soap_action', 'soap_version', 'transport', 'url_params_pri', 'url_path', 'sec_use_rbac',
-            'cache_type', 'cache_id', 'cache_name', 'cache_expiry'):
+            'cache_type', 'cache_id', 'cache_name', 'cache_expiry', 'content_encoding', 'match_slash'):
 
             channel_item[name] = msg[name]
 
@@ -1144,17 +1206,13 @@ class URLData(CyURLData, OAuthDataStore):
             channel_item['security_id'] = msg['security_id']
             channel_item['security_name'] = msg['security_name']
 
-        channel_item['audit_enabled'] = old_data.get('audit_enabled', False)
-        channel_item['audit_max_payload'] = old_data.get('audit_max_payload', 0)
-        channel_item['audit_repl_patt_type'] = old_data.get('audit_repl_patt_type', None)
-        channel_item['replace_patterns_json_pointer'] = old_data.get('replace_patterns_json_pointer', [])
-        channel_item['replace_patterns_xpath'] = old_data.get('replace_patterns_xpath', [])
-
         channel_item['service_impl_name'] = msg['impl_name']
         channel_item['match_target'] = match_target
-        channel_item['match_target_compiled'] = Matcher(channel_item['match_target'])
+        channel_item['match_target_compiled'] = Matcher(channel_item['match_target'], channel_item['match_slash'])
 
         return channel_item
+
+# ################################################################################################################################
 
     def _sec_info_from_msg(self, msg):
         """ Creates a security info bunch out of an incoming CREATE_EDIT message.
@@ -1171,29 +1229,41 @@ class URLData(CyURLData, OAuthDataStore):
             sec_config = getattr(self, '{}_config'.format(msg['sec_type']))
             config_item = sec_config[msg['security_name']]
 
-            for k, v in config_item['config'].items():
+            for k, v in iteritems(config_item['config']):
                 sec_info.sec_def[k] = config_item['config'][k]
         else:
             sec_info.sec_def = ZATO_NONE
 
         return sec_info
 
+# ################################################################################################################################
+
     def _create_channel(self, msg, old_data):
         """ Creates a new channel, both its core data and the related security definition.
         Clears out URL cache for that entry, if it existed at all.
         """
-        match_target = '{}{}{}'.format(msg.soap_action, MISC.SEPARATOR, msg.url_path)
+        match_target = get_match_target(msg, http_methods_allowed_re=self.worker.server.http_methods_allowed_re)
         self.channel_data.append(self._channel_item_from_msg(msg, match_target, old_data))
         self.url_sec[match_target] = self._sec_info_from_msg(msg)
-        self.url_path_cache.pop(match_target, None)
+
+        self._remove_from_cache(match_target)
         self.sort_channel_data()
+
+# ################################################################################################################################
 
     def _delete_channel(self, msg):
         """ Deletes a channel, both its core data and the related security definition. Clears relevant
         entry in URL cache. Returns the deleted data.
         """
-        old_match_target = '{}{}{}'.format(
-            msg.get('old_soap_action'), MISC.SEPARATOR, msg.get('old_url_path'))
+        old_match_target = get_match_target({
+            'http_method': msg.get('old_http_method'),
+            'http_accept': msg.get('old_http_accept'),
+            'soap_action': msg.get('old_soap_action'),
+            'url_path': msg.get('old_url_path'),
+        }, http_methods_allowed_re=self.worker.server.http_methods_allowed_re)
+
+        # Delete from URL cache
+        self._remove_from_cache(old_match_target)
 
         # In case of an internal error, we won't have the match all
         match_idx = ZATO_NONE
@@ -1210,13 +1280,12 @@ class URLData(CyURLData, OAuthDataStore):
         # Channel's security now
         del self.url_sec[old_match_target]
 
-        # Delete from URL cache
-        self.url_path_cache.pop(old_match_target, None)
-
         # Re-sort all elements to match against
         self.sort_channel_data()
 
         return old_data
+
+# ################################################################################################################################
 
     def on_broker_msg_CHANNEL_HTTP_SOAP_CREATE_EDIT(self, msg, *args):
         """ Creates or updates an HTTP/SOAP channel.
@@ -1240,128 +1309,11 @@ class URLData(CyURLData, OAuthDataStore):
 
 # ################################################################################################################################
 
-    def replace_payload(self, pattern_name, payload, pattern_type):
-        """ Replaces elements in a given payload using either JSON Pointer or XPath
-        """
-        store = self.json_pointer_store if pattern_type == MSG_PATTERN_TYPE.JSON_POINTER.id else self.xpath_store
-
-        logger.debug('Replacing pattern:`%r` in`%r` , store:`%r`', pattern_name, payload, store)
-
-        return store.set(pattern_name, payload, AUDIT_LOG.REPLACE_WITH, True)
-
-# ################################################################################################################################
-
-    def _dump_wsgi_environ(self, wsgi_environ):
-        """ A convenience method to dump WSGI environment with all the element repr'ed.
-        """
-        # TODO: There should be another copy of WSGI environ added with password masked out
-        env = wsgi_environ.items()
-        for elem in env:
-            if elem[0] == 'zato.channel_item':
-                elem[1]['password'] = AUDIT_LOG.REPLACE_WITH
-
-        return dumps({key: repr(value) for key, value in env})
-
-    def audit_set_request(self, cid, channel_item, payload, wsgi_environ):
-        """ Stores initial audit information, right after receiving a request.
-        """
-        if channel_item['audit_repl_patt_type'] == MSG_PATTERN_TYPE.JSON_POINTER.id:
-            payload = loads(payload) if payload else ''
-            pattern_list = channel_item['replace_patterns_json_pointer']
-        else:
-            pattern_list = channel_item['replace_patterns_xpath']
-
-        if payload:
-            for name in pattern_list:
-                logger.debug('Before `%r`:`%r`', name, payload)
-                payload = self.replace_payload(name, payload, channel_item.audit_repl_patt_type)
-                logger.debug('After `%r`:`%r`', name, payload)
-
-        if channel_item['audit_repl_patt_type'] == MSG_PATTERN_TYPE.JSON_POINTER.id:
-            payload = dumps(payload)
-
-        if channel_item['audit_max_payload']:
-            payload = payload[:channel_item['audit_max_payload']]
-
-        remote_addr = wsgi_environ.get('HTTP_X_FORWARDED_FOR')
-        if not remote_addr:
-            remote_addr = wsgi_environ.get('REMOTE_ADDR', '(None)')
-
-        self.odb.audit_set_request_http_soap(channel_item['id'], channel_item['name'], cid,
-            channel_item['transport'], channel_item['connection'], datetime.utcnow(),
-            channel_item.get('username'), remote_addr, self._dump_wsgi_environ(wsgi_environ), payload)
-
-    def audit_set_response(self, cid, response, wsgi_environ):
-        """ Stores audit info regarding a response to a previous request.
-        """
-        payload = dumps({
-            'cid': cid,
-            'invoke_ok': wsgi_environ['zato.http.response.status'][0] not in ('4', '5'),
-            'auth_ok': wsgi_environ['zato.http.response.status'][0] != '4',
-            'resp_time': datetime.utcnow().isoformat(),
-            'resp_headers': self._dump_wsgi_environ(wsgi_environ),
-            'resp_payload': response,
-        })
-
-        self.broker_client.publish({
-            'cid': cid,
-            'data_format':DATA_FORMAT.JSON,
-            'action': CHANNEL.HTTP_SOAP_AUDIT_RESPONSE.value,
-            'payload': payload,
-            'service': 'zato.http-soap.set-audit-response-data'
-        })
-
-    def on_broker_msg_CHANNEL_HTTP_SOAP_AUDIT_CONFIG(self, msg):
-        for item in self.channel_data:
-            if item['id'] == msg.id:
-                item['audit_max_payload'] = msg.audit_max_payload
-
-    def on_broker_msg_CHANNEL_HTTP_SOAP_AUDIT_STATE(self, msg):
-        for item in self.channel_data:
-            if item['id'] == msg.id:
-                item['audit_enabled'] = msg.audit_enabled
-                break
-
-    def on_broker_msg_CHANNEL_HTTP_SOAP_AUDIT_PATTERNS(self, msg):
-        for item in self.channel_data:
-            if item['id'] == msg.id:
-                item['audit_repl_patt_type'] = msg.audit_repl_patt_type
-
-                if item['audit_repl_patt_type'] == MSG_PATTERN_TYPE.JSON_POINTER.id:
-                    item['replace_patterns_json_pointer'] = msg.pattern_list
-                else:
-                    item['replace_patterns_xpath'] = msg.pattern_list
-
-                break
-
-    def _yield_pattern_list(self, msg):
-        for item in self.channel_data:
-            if msg.msg_pattern_type == MSG_PATTERN_TYPE.JSON_POINTER.id:
-                pattern_list = item['replace_patterns_json_pointer']
-            else:
-                pattern_list = item['replace_patterns_xpath']
-
-            if pattern_list:
-                yield item, pattern_list
-
     def on_broker_msg_MSG_JSON_POINTER_EDIT(self, msg):
-        with self.update_lock:
-            for _, pattern_list in self._yield_pattern_list(msg):
-                if msg.old_name in pattern_list:
-                    pattern_list.remove(msg.old_name)
-                    pattern_list.append(msg.name)
+        pass
 
     def on_broker_msg_MSG_JSON_POINTER_DELETE(self, msg):
-        with self.update_lock:
-            for item, pattern_list in self._yield_pattern_list(msg):
-
-                try:
-                    pattern_list.remove(msg.name)
-                except ValueError:
-                    # It's OK, this item wasn't using that particular JSON Pointer
-                    pass
-
-                yield item['id'], pattern_list
+        pass
 
 # ################################################################################################################################
 
@@ -1370,3 +1322,6 @@ class URLData(CyURLData, OAuthDataStore):
         pass
 
     on_broker_msg_SECURITY_TLS_CA_CERT_DELETE = on_broker_msg_SECURITY_TLS_CA_CERT_EDIT = on_broker_msg_SECURITY_TLS_CA_CERT_CREATE
+
+# ################################################################################################################################
+# ################################################################################################################################

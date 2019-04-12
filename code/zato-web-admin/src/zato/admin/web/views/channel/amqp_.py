@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 
 """
-Copyright (C) 2011 Dariusz Suchojad <dsuch at zato.io>
+Copyright (C) 2019, Zato Source s.r.o. https://zato.io
 
 Licensed under LGPLv3, see LICENSE.txt for terms and conditions.
 """
@@ -39,6 +39,7 @@ def _get_edit_create_message(params, prefix=''):
         'service': params[prefix + 'service'],
         'pool_size': params.get(prefix + 'pool_size'),
         'ack_mode': params.get(prefix + 'ack_mode'),
+        'prefetch_count': params.get(prefix + 'prefetch_count'),
         'data_format': params.get(prefix + 'data_format'),
     }
 
@@ -61,7 +62,7 @@ class Index(_Index):
     class SimpleIO(_Index.SimpleIO):
         input_required = ('cluster_id',)
         output_required = ('id', 'name', 'is_active', 'queue', 'consumer_tag_prefix', 'def_name', 'def_id', 'service_name',
-            'pool_size', 'ack_mode', 'data_format')
+            'pool_size', 'ack_mode','prefetch_count', 'data_format')
         output_repeated = True
 
     def handle(self):
@@ -84,8 +85,8 @@ def create(req):
         response = req.zato.client.invoke('zato.channel.amqp.create', _get_edit_create_message(req.POST))
         return _edit_create_response(req.zato.client, 'created', response.data.id,
             req.POST['name'], req.POST['def_id'], req.POST['cluster_id'])
-    except Exception, e:
-        msg = 'Could not create an AMQP channel, e:`{}`'.format(format_exc(e))
+    except Exception:
+        msg = 'Could not create an AMQP channel, e:`{}`'.format(format_exc())
         logger.error(msg)
         return HttpResponseServerError(msg)
 
@@ -97,8 +98,8 @@ def edit(req):
         return _edit_create_response(req.zato.client, 'updated', req.POST['id'], req.POST['edit-name'],
             req.POST['edit-def_id'], req.POST['cluster_id'])
 
-    except Exception, e:
-        msg = 'Could not update the AMQP channel, e:`{}`'.format(format_exc(e))
+    except Exception:
+        msg = 'Could not update the AMQP channel, e:`{}`'.format(format_exc())
         logger.error(msg)
         return HttpResponseServerError(msg)
 

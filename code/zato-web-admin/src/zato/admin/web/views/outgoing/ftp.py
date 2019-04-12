@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 
 """
-Copyright (C) 2011 Dariusz Suchojad <dsuch at zato.io>
+Copyright (C) 2019, Zato Source s.r.o. https://zato.io
 
 Licensed under LGPLv3, see LICENSE.txt for terms and conditions.
 """
@@ -29,7 +29,7 @@ class Index(_Index):
 
     class SimpleIO(_Index.SimpleIO):
         input_required = ('cluster_id',)
-        output_required = ('id', 'name', 'is_active', 'host', 'user', 'acct', 'timeout', 'port', 'dircache')
+        output_required = ('id', 'name', 'is_active', 'host', 'user', 'acct', 'timeout', 'port', 'dircache', 'use_ftps')
         output_repeated = True
 
     def handle(self):
@@ -43,7 +43,7 @@ class _CreateEdit(CreateEdit):
     method_allowed = 'POST'
 
     class SimpleIO(CreateEdit.SimpleIO):
-        input_required = ('name', 'is_active', 'host', 'user', 'timeout', 'acct', 'port', 'dircache')
+        input_required = ('name', 'is_active', 'host', 'user', 'timeout', 'acct', 'port', 'dircache', 'use_ftps')
         output_required = ('id', 'name')
 
     def success_message(self, item):

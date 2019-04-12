@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 
 """
-Copyright (C) 2011 Dariusz Suchojad <dsuch at zato.io>
+Copyright (C) 2019, Zato Source s.r.o. https://zato.io
 
 Licensed under LGPLv3, see LICENSE.txt for terms and conditions.
 """
@@ -13,6 +13,9 @@ from operator import itemgetter
 
 # Django
 from django import forms
+
+# Python 2/3 compatibility
+from future.utils import iteritems
 
 # Zato
 from zato.admin.web.forms import add_services, DataFormatForm
@@ -27,6 +30,7 @@ class CreateForm(DataFormatForm):
     pool_size = forms.CharField(
         initial=AMQP.DEFAULT.POOL_SIZE, widget=forms.TextInput(attrs={'style':'width:10%', 'class':'required'}))
     ack_mode = forms.ChoiceField(widget=forms.Select(attrs={'style':'width:20%'}))
+    prefetch_count = forms.CharField(initial=AMQP.DEFAULT.PREFETCH_COUNT, widget=forms.TextInput(attrs={'style':'width:10%'}))
     service = forms.ChoiceField(widget=forms.Select(attrs={'style':'width:100%'}))
 
     def __init__(self, prefix=None, post_data=None, req=None):
@@ -35,12 +39,12 @@ class CreateForm(DataFormatForm):
         add_services(self, req)
 
         self.fields['ack_mode'].choices = []
-        for item in AMQP.ACK_MODE:
+        for item in AMQP.ACK_MODE():
             self.fields['ack_mode'].choices.append([item.id, item.name])
 
     def set_def_id(self, def_ids):
         # Sort AMQP definitions by their names.
-        def_ids = sorted(def_ids.iteritems(), key=itemgetter(1))
+        def_ids = sorted(iteritems(def_ids), key=itemgetter(1))
 
         for id, name in def_ids:
             self.fields['def_id'].choices.append([id, name])

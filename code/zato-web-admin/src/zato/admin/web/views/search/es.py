@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 
 """
-Copyright (C) 2013 Dariusz Suchojad <dsuch at zato.io>
+Copyright (C) 2019, Zato Source s.r.o. https://zato.io
 
 Licensed under LGPLv3, see LICENSE.txt for terms and conditions.
 """
@@ -10,9 +10,6 @@ from __future__ import absolute_import, division, print_function, unicode_litera
 
 # stdlib
 import logging
-
-# elasticutils
-from elasticutils import DEFAULT_TIMEOUT
 
 # Zato
 from zato.admin.web.forms.search.es import CreateForm, EditForm
@@ -39,7 +36,7 @@ class Index(_Index):
         return {
             'create_form': CreateForm(),
             'edit_form': EditForm(prefix='edit'),
-            'default_timeout': DEFAULT_TIMEOUT,
+            'default_timeout': 90,
             'default_body_as': SEARCH.ES.DEFAULTS.BODY_AS.value
         }
 

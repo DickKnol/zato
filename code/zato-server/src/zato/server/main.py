@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 
 """
-Copyright (C) 2018, Zato Source s.r.o. https://zato.io
+Copyright (C) 2019, Zato Source s.r.o. https://zato.io
 
 Licensed under LGPLv3, see LICENSE.txt for terms and conditions.
 """
@@ -21,15 +21,28 @@ from zato.common.microopt import logging_Logger_log
 from logging import Logger
 Logger._log = logging_Logger_log
 
+# gevent monkeypatch is needed
+from gevent.monkey import patch_all
+patch_all()
+
+# Django
+import django
+from django.conf import settings
+
+# Configure Django settings when the module is picked up
+if not settings.configured:
+    settings.configure()
+    django.setup()
+
+# Bunch
+from bunch import Bunch
+
 # ConfigObj
 from configobj import ConfigObj
 
 # gunicorn
 import gunicorn
 from gunicorn.app.base import Application
-
-# Paste
-from paste.util.converters import asbool
 
 # psycopg2
 import psycopg2
@@ -44,13 +57,18 @@ from repoze.profile import ProfileMiddleware
 import yaml
 
 # Zato
-from zato.common import TRACE1
+from zato.common import SERVER_STARTUP, TRACE1, ZATO_CRYPTO_WELL_KNOWN_DATA
 from zato.common.crypto import ServerCryptoManager
 from zato.common.ipaddress_ import get_preferred_ip
+from zato.common.kvdb import KVDB
+from zato.common.odb.api import ODBManager, PoolStore
 from zato.common.repo import RepoManager
-from zato.common.util import absjoin, clear_locks, get_app_context, get_config, get_kvdb_config_for_log, \
-     parse_cmd_line_options, register_diag_handlers, store_pidfile
+from zato.common.util import absjoin, asbool, clear_locks, get_config, get_kvdb_config_for_log, parse_cmd_line_options, \
+     register_diag_handlers, store_pidfile
 from zato.common.util.cli import read_stdin_data
+from zato.server.base.parallel import ParallelServer
+from zato.server.service.store import ServiceStore
+from zato.server.startup_callable import StartupCallableTool
 from zato.sso.api import SSOAPI
 from zato.sso.util import new_user_id, normalize_sso_config
 
@@ -163,6 +181,8 @@ def run(base_dir, start_gunicorn_app=True, options=None):
     sso_config = get_config(repo_location, 'sso.conf', needs_user_config=False)
     normalize_sso_config(sso_config)
 
+    server_config.main.token = server_config.main.token.encode('utf8')
+
     # Do not proceed unless we can be certain our own preferred address or IP can be obtained.
     preferred_address = server_config.preferred_address.get('address')
 
@@ -173,6 +193,17 @@ def run(base_dir, start_gunicorn_app=True, options=None):
         msg = 'Unable to start the server. Could not obtain a preferred address, please configure [bind_options] in server.conf'
         logger.warn(msg)
         raise Exception(msg)
+
+    # Create the startup callable tool as soon as practical
+    startup_callable_tool = StartupCallableTool(server_config)
+
+    # Run the hook before there is any server object created
+    startup_callable_tool.invoke(SERVER_STARTUP.PHASE.FS_CONFIG_ONLY, kwargs={
+        'server_config': server_config,
+        'pickup_config': pickup_config,
+        'sio_config': sio_config,
+        'sso_config': sso_config,
+    })
 
     # New in 2.0 - Start monitoring as soon as possible
     if server_config.get('newrelic', {}).get('config'):
@@ -196,9 +227,6 @@ def run(base_dir, start_gunicorn_app=True, options=None):
         logger.info('Locale is `%s`, amount of %s -> `%s`', user_locale, value, locale.currency(
             value, grouping=True).decode('utf-8'))
 
-    # Spring Python
-    app_context = get_app_context(server_config)
-
     # Makes queries against Postgres asynchronous
     if asbool(server_config.odb.use_async_driver) and server_config.odb.engine == 'postgresql':
         make_psycopg_green()
@@ -206,9 +234,30 @@ def run(base_dir, start_gunicorn_app=True, options=None):
     if server_config.misc.http_proxy:
         os.environ['http_proxy'] = server_config.misc.http_proxy
 
-    server = app_context.get_object('server')
+    # Basic components needed for the server to boot up
+    kvdb = KVDB()
+    odb_manager = ODBManager(well_known_data=ZATO_CRYPTO_WELL_KNOWN_DATA)
+    sql_pool_store = PoolStore()
+
+    service_store = ServiceStore()
+    service_store.odb = odb_manager
+    service_store.services = {}
+
+    server = ParallelServer()
+    server.odb = odb_manager
+    server.service_store = service_store
+    server.service_store.server = server
+    server.sql_pool_store = sql_pool_store
+    server.service_modules = []
+    server.kvdb = kvdb
+    server.user_config = Bunch()
+
+    # Assigned here because it is a circular dependency
+    odb_manager.parallel_server = server
+
     zato_gunicorn_app = ZatoGunicornApplication(server, repo_location, server_config.main, server_config.crypto)
 
+    server.has_fg = options.get('fg')
     server.crypto_manager = crypto_manager
     server.odb_data = server_config.odb
     server.host = zato_gunicorn_app.zato_host
@@ -218,6 +267,7 @@ def run(base_dir, start_gunicorn_app=True, options=None):
     server.base_dir = base_dir
     server.logs_dir = os.path.join(server.base_dir, 'logs')
     server.tls_dir = os.path.join(server.base_dir, 'config', 'repo', 'tls')
+    server.static_dir = os.path.join(server.base_dir, 'config', 'repo', 'static')
     server.fs_server_config = server_config
     server.fs_sql_config = get_config(repo_location, 'sql.conf', needs_user_config=False)
     server.pickup_config = pickup_config
@@ -226,17 +276,16 @@ def run(base_dir, start_gunicorn_app=True, options=None):
     server.sio_config = sio_config
     server.sso_config = sso_config
     server.user_config.update(server_config.user_config_items)
-    server.app_context = app_context
     server.preferred_address = preferred_address
     server.sync_internal = options['sync_internal']
     server.jwt_secret = server.fs_server_config.misc.jwt_secret.encode('utf8')
+    server.startup_callable_tool = startup_callable_tool
     server.is_sso_enabled = server.fs_server_config.component_enabled.sso
     if server.is_sso_enabled:
         server.sso_api = SSOAPI(server, sso_config, None, crypto_manager.encrypt, crypto_manager.decrypt,
             crypto_manager.hash_secret, crypto_manager.verify_hash, new_user_id)
 
     # Remove all locks possibly left over by previous server instances
-    kvdb = app_context.get_object('kvdb')
     kvdb.component = 'master-proc'
     clear_locks(kvdb, server_config.main.token, server_config.kvdb, crypto_manager.decrypt)
 
@@ -289,6 +338,11 @@ def run(base_dir, start_gunicorn_app=True, options=None):
     for key, value in os_environ.items():
         os.environ[key] = value
 
+    # Run the hook right before the Gunicorn-level server actually starts
+    startup_callable_tool.invoke(SERVER_STARTUP.PHASE.IMPL_BEFORE_RUN, kwargs={
+        'zato_gunicorn_app': zato_gunicorn_app,
+    })
+
     # Run the app at last
     if start_gunicorn_app:
         zato_gunicorn_app.run()
@@ -298,10 +352,13 @@ def run(base_dir, start_gunicorn_app=True, options=None):
 # ################################################################################################################################
 
 if __name__ == '__main__':
-    base_dir = sys.argv[1]
-    if not os.path.isabs(base_dir):
-        base_dir = os.path.abspath(os.path.join(os.getcwd(), base_dir))
 
-    run(base_dir, options=parse_cmd_line_options(sys.argv[2]))
+    server_base_dir = sys.argv[1]
+    cmd_line_options = sys.argv[2]
+
+    if not os.path.isabs(server_base_dir):
+        server_base_dir = os.path.abspath(os.path.join(os.getcwd(), server_base_dir))
+
+    run(server_base_dir, options=parse_cmd_line_options(cmd_line_options))
 
 # ################################################################################################################################

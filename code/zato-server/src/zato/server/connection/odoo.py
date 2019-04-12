@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 
 """
-Copyright (C) 2014 Dariusz Suchojad <dsuch at zato.io>
+Copyright (C) 2019, Zato Source s.r.o. https://zato.io
 
 Licensed under LGPLv3, see LICENSE.txt for terms and conditions.
 """
@@ -15,12 +15,18 @@ from traceback import format_exc
 # gevent
 from gevent.lock import RLock
 
-# openerp-client-lib
-import openerplib
-
 # Zato
+from zato.common import SECRETS
 from zato.common.util import ping_odoo
 from zato.server.connection.queue import ConnectionQueue
+
+# Python 2/3 compatibility
+from six import PY2
+
+if PY2:
+    import openerplib as client_lib
+else:
+    import odoolib as client_lib
 
 # ################################################################################################################################
 
@@ -34,6 +40,12 @@ class OdooWrapper(object):
     def __init__(self, config, server):
         self.config = config
         self.server = server
+
+        # Decrypt the password if it is encrypted. It will be in clear text when the server is starting up
+        # but otherwise for connections created in run-time, it will be decrypted.
+        if self.config.password.startswith(SECRETS.PREFIX):
+            self.config.password = self.server.decrypt(self.config.password)
+
         self.url = '{protocol}://{user}:******@{host}:{port}/{database}'.format(**self.config)
         self.client = ConnectionQueue(
             self.config.pool_size, self.config.queue_build_cap, self.config.name, 'Odoo', self.url, self.add_client)
@@ -47,12 +59,14 @@ class OdooWrapper(object):
 
     def add_client(self):
 
-        conn = openerplib.get_connection(hostname=self.config.host, protocol=self.config.protocol, port=self.config.port,
+        conn = client_lib.get_connection(hostname=self.config.host, protocol=self.config.protocol, port=self.config.port,
             database=self.config.database, login=self.config.user, password=self.config.password)
 
         try:
             ping_odoo(conn)
-        except Exception, e:
-            logger.warn('Could not ping Odoo (%s), e:`%s`', self.config.name, format_exc(e))
+        except Exception:
+            logger.warn('Could not ping Odoo (%s), e:`%s`', self.config.name, format_exc())
 
         self.client.put_client(conn)
+
+# ################################################################################################################################

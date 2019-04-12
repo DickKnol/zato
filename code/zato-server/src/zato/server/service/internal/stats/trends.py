@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 
 """
-Copyright (C) 2012 Dariusz Suchojad <dsuch at zato.io>
+Copyright (C) 2019, Zato Source s.r.o. https://zato.io
 
 Licensed under LGPLv3, see LICENSE.txt for terms and conditions.
 """
@@ -20,6 +20,7 @@ class GetTrends(StatsReturningService):
         request_elem = 'zato_stats_get_trends_request'
         response_elem = 'zato_stats_get_trends_response'
         input_required = StatsReturningService.SimpleIO.input_required + (Integer('n'), 'n_type')
+        input_optional = ('service_name',)
 
     def handle(self):
         self.response.payload[:] = (elem.to_dict() for elem in self.get_stats(self.request.input.start,
